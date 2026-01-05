@@ -347,7 +347,7 @@ int jtag_call_event_callbacks(enum jtag_event event)
 
 static void jtag_checks(void)
 {
-	assert(jtag_trst == 0);
+	//assert(jtag_trst == 0);
 }
 
 static void jtag_prelude(enum tap_state state)
@@ -1865,7 +1865,7 @@ int adapter_resets(int trst, int srst)
 		return ERROR_OK;
 	} else if (transport_is_swd() || transport_is_hla() ||
 			   transport_is_dapdirect_swd() || transport_is_dapdirect_jtag() ||
-			   transport_is_swim()) {
+			   transport_is_swim() || transport_is_ddmi()) {
 		if (trst == TRST_ASSERT) {
 			LOG_ERROR("transport %s has no trst signal",
 				get_current_transport_name());

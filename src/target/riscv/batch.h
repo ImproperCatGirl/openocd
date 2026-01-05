@@ -120,6 +120,39 @@ static inline int riscv_scan_increase_delay(struct riscv_scan_delays *delays,
 	return ERROR_OK;
 }
 
+
+typedef enum {
+    RV_OP_INVALID = 0,
+    RV_OP_READ,
+    RV_OP_WRITE,
+} ddmi_opcode_t;
+
+typedef struct {
+    ddmi_opcode_t opcode;
+    union {
+        struct {
+            unsigned int addr;
+            uint32_t data_from_target; // Result of read
+        } read;
+        struct {
+            unsigned int addr;
+            uint32_t data_to_target;   // Value to write
+        } write;
+    } params;
+} ddmi_op_t;
+
+
+typedef struct {
+    size_t allocated_ops;
+    size_t used_ops;
+
+    ddmi_op_t *ops;
+
+    size_t *read_keys;
+    size_t read_keys_used;
+} ddmi_batch_t;
+
+
 /* A batch of multiple JTAG scans, which are grouped together to avoid the
  * overhead of some JTAG adapters when sending single commands.  This is
  * designed to support block copies, as that's what we actually need to go
@@ -159,7 +192,9 @@ struct riscv_batch {
 	 * Only valid when `was_run` is set.
 	 */
 	unsigned int last_scan_delay;
+	ddmi_batch_t* ddmi_batch;
 };
+
 
 /* Allocates (or frees) a new scan set.  "scans" is the maximum number of JTAG
  * scans that can be issued to this object. */
@@ -186,6 +221,9 @@ int riscv_batch_run_from(struct riscv_batch *batch, size_t start_idx,
 		const struct riscv_scan_delays *delays, bool resets_delays,
 		size_t reset_delays_after);
 
+
+int ddmi_batch_run(struct riscv_batch *batch);
+
 /* Get the number of scans successfully executed form this batch. */
 size_t riscv_batch_finished_scans(const struct riscv_batch *batch);
 
@@ -197,9 +235,12 @@ static inline void
 riscv_batch_add_dm_write(struct riscv_batch *batch, uint32_t address, uint32_t data,
 	bool read_back, enum riscv_scan_delay_class delay_type)
 {
-	return riscv_batch_add_dmi_write(batch,
+	/*return riscv_batch_add_dmi_write(batch,
 			riscv_get_dmi_address(batch->target, address), data,
-			read_back, delay_type);
+			read_back, delay_type);*/
+	return riscv_batch_add_dmi_write(batch,
+		address, data,
+		read_back, delay_type);
 }
 
 /* DM register reads must be handled in two parts: the first one schedules a read and
@@ -212,8 +253,10 @@ static inline size_t
 riscv_batch_add_dm_read(struct riscv_batch *batch, uint32_t address,
 		enum riscv_scan_delay_class delay_type)
 {
+	/*return riscv_batch_add_dmi_read(batch,
+			riscv_get_dmi_address(batch->target, address), delay_type);*/
 	return riscv_batch_add_dmi_read(batch,
-			riscv_get_dmi_address(batch->target, address), delay_type);
+		address, delay_type);
 }
 
 uint32_t riscv_batch_get_dmi_read_op(const struct riscv_batch *batch, size_t key);

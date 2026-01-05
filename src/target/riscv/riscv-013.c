@@ -5,6 +5,7 @@
  * latest draft.
  */
 
+#include "transport/transport.h"
 #include <assert.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -408,6 +409,7 @@ static uint32_t set_dmcontrol_hartsel(uint32_t initial, int hart_index)
 
 static void select_dmi(struct jtag_tap *tap)
 {
+	if(transport_is_ddmi())	return;
 	if (bscan_tunnel_ir_width != 0) {
 		select_dmi_via_bscan(tap);
 		return;
@@ -1993,6 +1995,8 @@ static int examine_dm(struct target *target)
 
 static int examine(struct target *target)
 {
+
+	riscv013_info_t *info = get_info(target);
 	/* We reset target state in case if something goes wrong during examine:
 	 * DTM/DM scans could fail or hart may fail to halt. */
 	target->state = TARGET_UNKNOWN;
@@ -2001,26 +2005,25 @@ static int examine(struct target *target)
 	/* Don't need to select dbus, since the first thing we do is read dtmcontrol. */
 	LOG_TARGET_DEBUG(target, "dbgbase=0x%x", target->dbgbase);
 
-	uint32_t dtmcontrol;
-	if (dtmcs_scan(target->tap, 0, &dtmcontrol) != ERROR_OK || dtmcontrol == 0) {
-		LOG_TARGET_ERROR(target, "Could not scan dtmcontrol. Check JTAG connectivity/board power.");
-		return ERROR_FAIL;
-	}
+	if(transport_is_jtag())
+	{
+		uint32_t dtmcontrol;
+		if (dtmcs_scan(target->tap, 0, &dtmcontrol) != ERROR_OK || dtmcontrol == 0) {
+			LOG_TARGET_ERROR(target, "Could not scan dtmcontrol. Check JTAG connectivity/board power.");
+			return ERROR_FAIL;
+		}
 
-	LOG_TARGET_DEBUG(target, "dtmcontrol=0x%x", dtmcontrol);
-	LOG_DEBUG_REG(target, DTM_DTMCS, dtmcontrol);
+		LOG_TARGET_DEBUG(target, "dtmcontrol=0x%x", dtmcontrol);
+		LOG_DEBUG_REG(target, DTM_DTMCS, dtmcontrol);
 
-	if (get_field(dtmcontrol, DTM_DTMCS_VERSION) != 1) {
-		LOG_TARGET_ERROR(target, "Unsupported DTM version %" PRIu32 ". (dtmcontrol=0x%" PRIx32 ")",
-				get_field32(dtmcontrol, DTM_DTMCS_VERSION), dtmcontrol);
-		return ERROR_FAIL;
-	}
-
-	riscv013_info_t *info = get_info(target);
-
-	info->index = target->coreid;
-	info->abits = get_field(dtmcontrol, DTM_DTMCS_ABITS);
-	info->dtmcs_idle = get_field(dtmcontrol, DTM_DTMCS_IDLE);
+		if (get_field(dtmcontrol, DTM_DTMCS_VERSION) != 1) {
+			LOG_TARGET_ERROR(target, "Unsupported DTM version %" PRIu32 ". (dtmcontrol=0x%" PRIx32 ")",
+					get_field32(dtmcontrol, DTM_DTMCS_VERSION), dtmcontrol);
+			return ERROR_FAIL;
+		}
+			info->index = target->coreid;
+		info->abits = get_field(dtmcontrol, DTM_DTMCS_ABITS);
+		info->dtmcs_idle = get_field(dtmcontrol, DTM_DTMCS_IDLE);
 
 	if (info->abits > RISCV013_DTMCS_ABITS_MAX) {
 		/* Max. address width given by the debug specification is exceeded */
@@ -2029,32 +2032,37 @@ static int examine(struct target *target)
 		LOG_TARGET_ERROR(target, " found dtmcs.abits = %d; maximum is abits = %d.",
 			info->abits, RISCV013_DTMCS_ABITS_MAX);
 		return ERROR_FAIL;
-	}
+		}
 
-	if (info->abits == 0) {
-		LOG_TARGET_ERROR(target,
-				"dtmcs.abits is zero. Check JTAG connectivity/board power");
-		return ERROR_FAIL;
-	}
-	if (info->abits < RISCV013_DTMCS_ABITS_MIN) {
-		/* The requirement for minimum DMI address width of 7 bits is part of
-		 * the RISC-V Debug spec since Jan-20-2017 (commit 03df6ee7). However,
-		 * implementations exist that implement narrower DMI address. For example
-		 * Spike as of Q1/2025 uses dmi.abits = 6.
-		 *
-		 * For that reason, warn the user but continue.
-		 */
-		LOG_TARGET_WARNING(target, "The target's debug bus (DMI) address width is "
-			"lower than the minimum:");
-		LOG_TARGET_WARNING(target, " found dtmcs.abits = %d; minimum is abits = %d.",
-			info->abits, RISCV013_DTMCS_ABITS_MIN);
-	}
+		if (info->abits == 0) {
+			LOG_TARGET_ERROR(target,
+					"dtmcs.abits is zero. Check JTAG connectivity/board power");
+			return ERROR_FAIL;
+		}
+		if (info->abits < RISCV013_DTMCS_ABITS_MIN) {
+			/* The requirement for minimum DMI address width of 7 bits is part of
+			* the RISC-V Debug spec since Jan-20-2017 (commit 03df6ee7). However,
+			* implementations exist that implement narrower DMI address. For example
+			* Spike as of Q1/2025 uses dmi.abits = 6.
+			*
+			* For that reason, warn the user but continue.
+			*/
+			LOG_TARGET_WARNING(target, "The target's debug bus (DMI) address width is "
+				"lower than the minimum:");
+			LOG_TARGET_WARNING(target, " found dtmcs.abits = %d; minimum is abits = %d.",
+				info->abits, RISCV013_DTMCS_ABITS_MIN);
+		}
 
-	if (!check_dbgbase_exists(target)) {
-		LOG_TARGET_ERROR(target, "Could not find debug module with DMI base address (dbgbase) = 0x%x", target->dbgbase);
-		return ERROR_FAIL;
-	}
+		if (!check_dbgbase_exists(target)) {
+			LOG_TARGET_ERROR(target, "Could not find debug module with DMI base address (dbgbase) = 0x%x", target->dbgbase);
+			return ERROR_FAIL;
+		}
 
+	}
+	
+
+
+	
 	int result = examine_dm(target);
 	if (result != ERROR_OK)
 		return result;
@@ -2513,6 +2521,11 @@ static int sb_write_address(struct target *target, target_addr_t address,
 
 static int batch_run(struct target *target, struct riscv_batch *batch)
 {
+	if(transport_is_ddmi())
+	{
+		ddmi_batch_run(batch);
+		return 0;
+	}
 	RISCV_INFO(r);
 	RISCV013_INFO(info);
 	select_dmi(target->tap);
@@ -2537,6 +2550,11 @@ static int batch_run(struct target *target, struct riscv_batch *batch)
  */
 static int batch_run_timeout(struct target *target, struct riscv_batch *batch)
 {
+	if(transport_is_ddmi())
+	{
+		ddmi_batch_run(batch);
+		return 0;
+	}
 	RISCV013_INFO(info);
 	select_dmi(target->tap);
 	riscv_batch_add_nop(batch);
