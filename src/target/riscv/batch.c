@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "transport/transport.h"
 #ifdef HAVE_CONFIG_H
 #include "config.h"
 #endif
@@ -10,10 +11,17 @@
 #include "riscv.h"
 #include "field_helpers.h"
 
+#include "jtag/ddmi.h"
+
 // TODO: DTM_DMI_MAX_ADDRESS_LENGTH should be reduced to 32 (per the debug spec)
 #define DTM_DMI_MAX_ADDRESS_LENGTH	((1<<DTM_DTMCS_ABITS_LENGTH)-1)
 #define DMI_SCAN_MAX_BIT_LENGTH (DTM_DMI_MAX_ADDRESS_LENGTH + DTM_DMI_DATA_LENGTH + DTM_DMI_OP_LENGTH)
 
+#define DMI_SCAN_BUF_SIZE (DIV_ROUND_UP(DMI_SCAN_MAX_BIT_LENGTH, 8))
+
+
+#define DTM_DMI_MAX_ADDRESS_LENGTH	((1<<DTM_DTMCS_ABITS_LENGTH)-1)
+#define DMI_SCAN_MAX_BIT_LENGTH (DTM_DMI_MAX_ADDRESS_LENGTH + DTM_DMI_DATA_LENGTH + DTM_DMI_OP_LENGTH)
 #define DMI_SCAN_BUF_SIZE (DIV_ROUND_UP(DMI_SCAN_MAX_BIT_LENGTH, 8))
 
 /* Reserve extra room in the batch (needed for the last NOP operation) */
@@ -30,6 +38,27 @@ static unsigned int get_dmi_scan_length(const struct target *target)
 
 struct riscv_batch *riscv_batch_alloc(struct target *target, size_t scans)
 {
+	if (transport_is_ddmi()) {
+		// 1. Allocate the main wrapper
+		struct riscv_batch *batch = calloc(1, sizeof(*batch));
+		if (!batch) return NULL;
+
+		// 2. Allocate the actual DDMI container 
+		batch->ddmi_batch = calloc(1, sizeof(*(batch->ddmi_batch)));
+		if (!batch->ddmi_batch) {
+			free(batch);
+			return NULL;
+		}
+
+		batch->ddmi_batch->allocated_ops = scans;
+		
+		// 3. Allocate arrays inside the DDMI container
+		batch->ddmi_batch->ops = calloc(scans, sizeof(*(batch->ddmi_batch->ops)));
+		
+		batch->ddmi_batch->read_keys = calloc(scans, sizeof(*(batch->ddmi_batch->read_keys)));
+		
+		return batch;
+	}
 	scans += BATCH_RESERVED_SCANS;
 	struct riscv_batch *out = calloc(1, sizeof(*out));
 	if (!out) {
@@ -101,7 +130,26 @@ void riscv_batch_free(struct riscv_batch *batch)
 	free(batch->delay_classes);
 	free(batch->bscan_ctxt);
 	free(batch->read_keys);
+	free(batch->ddmi_batch->ops);
+    free(batch->ddmi_batch->read_keys);
 	free(batch);
+}
+
+
+int ddmi_batch_run(struct riscv_batch *batch)
+{
+	keep_alive();
+    for (size_t i = 0; i < batch->ddmi_batch->used_ops; ++i) {
+        if (batch->ddmi_batch->ops[i].opcode == RV_OP_READ) {
+			ddmi_read(NULL, &batch->ddmi_batch->ops[i].params.read.data_from_target, batch->ddmi_batch->ops[i].params.read.addr);
+        }
+		if (batch->ddmi_batch->ops[i].opcode == RV_OP_WRITE) {
+			ddmi_write(NULL, batch->ddmi_batch->ops[i].params.write.addr, batch->ddmi_batch->ops[i].params.write.data_to_target);
+        }
+    }
+	jtag_execute_queue();
+	keep_alive();
+	return ERROR_OK;
 }
 
 bool riscv_batch_full(struct riscv_batch *batch)
@@ -331,6 +379,16 @@ int riscv_batch_run_from(struct riscv_batch *batch, size_t start_idx,
 void riscv_batch_add_dmi_write(struct riscv_batch *batch, uint32_t address, uint32_t data,
 		bool read_back, enum riscv_scan_delay_class delay_class)
 {
+	if(transport_is_ddmi())
+	{
+		assert(batch->ddmi_batch->used_ops < batch->ddmi_batch->allocated_ops);
+
+		ddmi_op_t *op = &batch->ddmi_batch->ops[batch->ddmi_batch->used_ops++];
+		op->opcode = RV_OP_WRITE;
+		op->params.write.addr = address;
+		op->params.write.data_to_target = data;
+		return;
+	}
 	// TODO: Check that the bit width of "address" is no more than dtmcs.abits,
 	// otherwise return an error (during batch creation or when the batch is executed).
 
@@ -361,6 +419,18 @@ void riscv_batch_add_dmi_write(struct riscv_batch *batch, uint32_t address, uint
 size_t riscv_batch_add_dmi_read(struct riscv_batch *batch, uint32_t address,
 		enum riscv_scan_delay_class delay_class)
 {
+	if(transport_is_ddmi())
+	{
+		assert(batch->ddmi_batch->used_ops < batch->ddmi_batch->allocated_ops);
+
+		ddmi_op_t *op = &batch->ddmi_batch->ops[batch->ddmi_batch->used_ops++];
+		op->opcode = RV_OP_READ;
+		op->params.read.addr = address;
+		op->params.read.data_from_target = 0; // initially empty
+
+		batch->ddmi_batch->read_keys[batch->ddmi_batch->read_keys_used] = batch->ddmi_batch->used_ops - 1;
+		return batch->ddmi_batch->read_keys_used++;
+	}
 	// TODO: Check that the bit width of "address" is no more than dtmcs.abits,
 	// otherwise return an error (during batch creation or when the batch is executed).
 
@@ -388,6 +458,7 @@ size_t riscv_batch_add_dmi_read(struct riscv_batch *batch, uint32_t address,
 
 uint32_t riscv_batch_get_dmi_read_op(const struct riscv_batch *batch, size_t key)
 {
+	if(transport_is_ddmi()) return 0;
 	assert(key < batch->read_keys_used);
 	size_t index = batch->read_keys[key];
 	assert(index < batch->used_scans);
@@ -398,6 +469,14 @@ uint32_t riscv_batch_get_dmi_read_op(const struct riscv_batch *batch, size_t key
 
 uint32_t riscv_batch_get_dmi_read_data(const struct riscv_batch *batch, size_t key)
 {
+	if(transport_is_ddmi())
+	{
+		assert(key < batch->ddmi_batch->read_keys_used);
+		size_t index = batch->ddmi_batch->read_keys[key];
+		assert(index < batch->ddmi_batch->used_ops);
+
+		return batch->ddmi_batch->ops[index].params.read.data_from_target;
+	}
 	assert(key < batch->read_keys_used);
 	size_t index = batch->read_keys[key];
 	assert(index < batch->used_scans);
@@ -408,6 +487,7 @@ uint32_t riscv_batch_get_dmi_read_data(const struct riscv_batch *batch, size_t k
 
 void riscv_batch_add_nop(struct riscv_batch *batch)
 {
+	if(transport_is_ddmi())	return;
 	assert(batch->used_scans < batch->allocated_scans);
 	struct scan_field *field = batch->fields + batch->used_scans;
 
@@ -431,12 +511,20 @@ void riscv_batch_add_nop(struct riscv_batch *batch)
 
 size_t riscv_batch_available_scans(struct riscv_batch *batch)
 {
+	if(transport_is_ddmi())
+	{
+
+		if (batch->ddmi_batch->used_ops >= batch->ddmi_batch->allocated_ops)
+        return 0;
+    	return batch->ddmi_batch->allocated_ops - batch->ddmi_batch->used_ops;
+	}
 	assert(batch->allocated_scans >= (batch->used_scans + BATCH_RESERVED_SCANS));
 	return batch->allocated_scans - batch->used_scans - BATCH_RESERVED_SCANS;
 }
 
 bool riscv_batch_was_batch_busy(const struct riscv_batch *batch)
 {
+	return false;
 	assert(batch->was_run);
 	assert(batch->used_scans);
 	assert(batch->last_scan == RISCV_SCAN_TYPE_NOP);

@@ -22,6 +22,7 @@ DRIVERFILES =
 # Standard Driver: common files
 DRIVERFILES += %D%/driver.c
 
+
 if USE_LIBUSB1
 DRIVERFILES += %D%/libusb_helper.c
 %C%_libocdjtagdrivers_la_CPPFLAGS += $(LIBUSB1_CFLAGS)
@@ -219,6 +220,9 @@ endif
 if XVC
 DRIVERFILES += %D%/xvc.c
 endif
+
+
+DRIVERFILES += %D%/ddmi_demo.c
 
 DRIVERHEADERS = \
 	%D%/bitbang.h \

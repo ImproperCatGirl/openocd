@@ -461,6 +461,7 @@ static struct target_type *get_target_type(struct target *target)
 	}
 
 	RISCV_INFO(info);
+
 	switch (info->dtm_version) {
 	case DTM_DTMCS_VERSION_0_11:
 		return &riscv011_target;
@@ -2476,7 +2477,6 @@ static int riscv_examine(struct target *target)
 		LOG_TARGET_DEBUG(target, "Target was already examined.");
 		return ERROR_OK;
 	}
-
 	/* Don't need to select dbus, since the first thing we do is read dtmcontrol. */
 
 	RISCV_INFO(info);
