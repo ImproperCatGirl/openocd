@@ -15,8 +15,8 @@ struct ddmi_usb {
 
 #define VID 0xCAFE
 #define PID 0x4002
-#define EP_OUT 0x01 // Bulk OUT endpoint (host to device)
-#define EP_IN 0x81  // Bulk IN endpoint (device to host)
+#define EP_OUT 0x04 // Bulk OUT endpoint (host to device)
+#define EP_IN 0x84  // Bulk IN endpoint (device to host)
 #define TIMEOUT_MS 1000
 
 static struct ddmi_usb ddmi_usb_priv;
