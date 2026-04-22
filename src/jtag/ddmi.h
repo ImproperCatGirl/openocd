@@ -27,6 +27,8 @@ struct ddmi_driver {
      * System reset
      */
     int (*srst)(int srst, int trst);
+
+    void (*batch_exec)(void);
 };
 
 extern struct ddmi_driver *ddmi_driver;
@@ -34,4 +36,5 @@ extern struct ddmi_driver *ddmi_driver;
 int ddmi_read(struct target *target, uint32_t *value, uint32_t address);
 int ddmi_write(struct target *target, uint32_t address, uint32_t value);
 
+void ddmi_batch_exec(void);
 #endif
