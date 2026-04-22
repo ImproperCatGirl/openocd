@@ -147,7 +147,7 @@ int ddmi_batch_run(struct riscv_batch *batch)
 			ddmi_write(NULL, batch->ddmi_batch->ops[i].params.write.addr, batch->ddmi_batch->ops[i].params.write.data_to_target);
         }
     }
-	jtag_execute_queue();
+	ddmi_batch_exec();
 	keep_alive();
 	return ERROR_OK;
 }
@@ -515,7 +515,7 @@ size_t riscv_batch_available_scans(struct riscv_batch *batch)
 	{
 
 		if (batch->ddmi_batch->used_ops >= batch->ddmi_batch->allocated_ops)
-        return 0;
+        	return 0;
     	return batch->ddmi_batch->allocated_ops - batch->ddmi_batch->used_ops;
 	}
 	assert(batch->allocated_scans >= (batch->used_scans + BATCH_RESERVED_SCANS));

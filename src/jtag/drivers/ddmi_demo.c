@@ -30,7 +30,7 @@ struct ddmi_usb_op {
     uint32_t *data_from_target;
 } ddmi_usb_op_t;
 
-#define MAX_BYTES 512
+#define MAX_BYTES 64
 #define MAX_BATCH 200
 #define CMD_SIZE      9
 #define RESP_SIZE     4
@@ -97,7 +97,11 @@ void batch_init(struct rv_usb_batch *batch) {
 }
 // Add a read to the batch and store the destination pointer
 void batch_add_read(struct rv_usb_batch *batch, uint32_t addr, uint32_t *dest) {
-    if (batch->num_ops >= MAX_BATCH) return;
+    if (batch->num_ops >= MAX_BATCH)
+    {
+        LOG_ERROR("BATCH TOO BIG!\n");
+        return;
+    } 
 
     // 1. Setup the command in the USB buffer
     uint8_t *ptr = &batch->buffer[batch->num_ops * CMD_SIZE];
@@ -114,8 +118,11 @@ void batch_add_read(struct rv_usb_batch *batch, uint32_t addr, uint32_t *dest) {
 }
 
 int batch_add_op(struct rv_usb_batch *batch, char type, uint32_t addr, uint32_t data) {
-    if (batch->num_ops >= MAX_BATCH) return -1;
-
+    if (batch->num_ops >= MAX_BATCH)
+    {
+        LOG_ERROR("BATCH TOO BIG!\n");
+        return -1;
+    } 
     uint8_t *ptr = &batch->buffer[batch->num_ops * CMD_SIZE];
     ptr[0] = (uint8_t)type;
     memcpy(ptr + 1, &addr, 4);
@@ -194,7 +201,7 @@ static uint32_t results_scratch[MAX_BATCH];
 
 
 #define MAX_OPS_PER_CHUNK 6
-int batch_execute(libusb_device_handle *handle, struct rv_usb_batch *batch) {
+int batch_execute_single(libusb_device_handle *handle, struct rv_usb_batch *batch) {
     if (!batch || batch->num_ops == 0)
         return ERROR_OK;
 
@@ -244,7 +251,11 @@ int batch_execute(libusb_device_handle *handle, struct rv_usb_batch *batch) {
         uint32_t *dest = batch->reads[i].dest;
         size_t global_idx = batch->reads[i].batch_index;
         if (dest)
+        {
+            LOG_DEBUG("result = %08X\n", results_scratch[global_idx]);
             *dest = results_scratch[global_idx];
+        }
+            
     }
     
     batch->num_ops = 0;
@@ -252,6 +263,71 @@ int batch_execute(libusb_device_handle *handle, struct rv_usb_batch *batch) {
     return ERROR_OK;
     // 6. IMPORTANT: Reset batch immediately to prevent double-execution
 
+}
+
+
+
+#define PROBE_MAX_PACKETS 5
+#define MAX_OPS_PER_PACKET 6
+#define MAX_OPS_PER_CHAIN (PROBE_MAX_PACKETS * MAX_OPS_PER_PACKET) // 60 ops
+
+int batch_execute(libusb_device_handle *handle, struct rv_usb_batch *batch) {
+    if (!batch || batch->num_ops == 0) return ERROR_OK;
+
+    size_t global_ops_completed = 0;
+
+    // Outer loop: Break the massive OpenOCD batch into "Probe-Sized" chains
+    while (global_ops_completed < batch->num_ops) {
+        size_t ops_remaining = batch->num_ops - global_ops_completed;
+        size_t chain_size = (ops_remaining > MAX_OPS_PER_CHAIN) ? MAX_OPS_PER_CHAIN : ops_remaining;
+        
+        uint8_t total_packets_in_chain = (chain_size + MAX_OPS_PER_PACKET - 1) / MAX_OPS_PER_PACKET;
+        size_t ops_in_this_chain = 0;
+        // --- PHASE 1: Send the Chain ---
+        for (uint8_t p = 0; p < total_packets_in_chain; p++) {
+            size_t ops_in_packet = (chain_size - ops_in_this_chain);
+            if (ops_in_packet > MAX_OPS_PER_PACKET) ops_in_packet = MAX_OPS_PER_PACKET;
+
+            uint8_t tx_buf[64] = {0};
+            tx_buf[0] = (total_packets_in_chain - 1) - p; // Countdown
+            tx_buf[1] = (uint8_t)ops_in_packet;           // Op count
+
+            // Copy commands from the global batch buffer
+            memcpy(tx_buf + 2, batch->buffer + ((global_ops_completed + ops_in_this_chain) * CMD_SIZE), 
+                   ops_in_packet * CMD_SIZE);
+
+            int transferred;
+            //printf("this packet has %d commands, total %d bytes long, countdown %d\n", (int)ops_in_packet, 64, tx_buf[0]);
+            libusb_bulk_transfer(handle, EP_OUT, tx_buf, 64, &transferred, 1000);
+            
+            ops_in_this_chain += ops_in_packet;
+        }
+
+        // --- PHASE 2: Collect Results for this Chain ---
+        size_t bytes_to_receive = chain_size * RESP_SIZE;
+        size_t received = 0;
+        while (received < bytes_to_receive) {
+            int actual;
+            // Place results into the correct global offset
+            uint8_t *dest_ptr = ((uint8_t*)results_scratch) + (global_ops_completed * RESP_SIZE) + received;
+            
+            libusb_bulk_transfer(handle, EP_IN, dest_ptr, (int)(bytes_to_receive - received), &actual, 1000);
+            //printf("RX actual = %d\n", actual);
+            received += actual;
+        }
+
+        global_ops_completed += chain_size;
+        //printf("global ops completed %d\n",(int) global_ops_completed);
+    }
+
+    // --- PHASE 3: Map results to OpenOCD pointers ---
+    for (size_t i = 0; i < batch->num_reads; i++) {
+        *batch->reads[i].dest = results_scratch[batch->reads[i].batch_index];
+    }
+
+    batch->num_ops = 0;
+    batch->num_reads = 0;
+    return ERROR_OK;
 }
 
 
@@ -271,6 +347,19 @@ static int ddmi_usb_quit(void)
     libusb_exit(ddmi_usb_priv.ctx);
     // libusb cleanup
     return ERROR_OK;
+}
+
+// ------------------------- Execute Queue -------------------------
+int ddmi_usb_execute_queue(struct jtag_command *cmd_queue)
+{
+    batch_execute(ddmi_usb_priv.handle, &r_w_buffer);
+    LOG_DEBUG("execute queue is currently implemented");
+    return 0;
+}
+
+void ddmi_exec_queue(void)
+{
+    batch_execute(ddmi_usb_priv.handle, &r_w_buffer);
 }
 static int ddmi_usb_init(void)
 {
@@ -313,6 +402,7 @@ static int ddmi_usb_init(void)
         .dmi_read = ddmi_usb_dmi_read,
         .dmi_write = ddmi_usb_dmi_write,
         .srst = ddmi_reset,  // Optional
+        .batch_exec = ddmi_exec_queue,
     };
     ddmi_driver = &usb_driver;
     
@@ -340,13 +430,6 @@ static const struct command_registration ddmi_command_handlers[] = {
 };
 
 
-// ------------------------- Execute Queue -------------------------
-int ddmi_usb_execute_queue(struct jtag_command *cmd_queue)
-{
-    batch_execute(ddmi_usb_priv.handle, &r_w_buffer);
-    LOG_DEBUG("execute queue is currently implemented");
-    return 0;
-}
 
 struct jtag_interface ddmi_usb_interface = {
     .supported = 0,           // No JTAG/SWD capabilities needed
