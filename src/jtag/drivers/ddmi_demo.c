@@ -14,7 +14,7 @@ struct ddmi_usb {
 
 
 #define VID 0xCAFE
-#define PID 0x4002
+#define PID 0x4008
 #define EP_OUT 0x04 // Bulk OUT endpoint (host to device)
 #define EP_IN 0x84  // Bulk IN endpoint (device to host)
 #define TIMEOUT_MS 1000
@@ -30,7 +30,6 @@ struct ddmi_usb_op {
     uint32_t *data_from_target;
 } ddmi_usb_op_t;
 
-#define MAX_BYTES 64
 #define MAX_BATCH 200
 #define CMD_SIZE      9
 #define RESP_SIZE     4
@@ -124,6 +123,7 @@ static uint32_t results_scratch[MAX_BATCH];
 #define PROBE_MAX_PACKETS 5
 #define MAX_OPS_PER_PACKET 6
 #define MAX_OPS_PER_CHAIN (PROBE_MAX_PACKETS * MAX_OPS_PER_PACKET) // 60 ops
+#define USB_MPS 64
 
 int batch_execute(libusb_device_handle *handle, struct rv_usb_batch *batch) {
     if (!batch || batch->num_ops == 0) return ERROR_OK;
@@ -142,7 +142,7 @@ int batch_execute(libusb_device_handle *handle, struct rv_usb_batch *batch) {
             size_t ops_in_packet = (chain_size - ops_in_this_chain);
             if (ops_in_packet > MAX_OPS_PER_PACKET) ops_in_packet = MAX_OPS_PER_PACKET;
 
-            uint8_t tx_buf[64] = {0};
+            uint8_t tx_buf[USB_MPS] = {0};
             tx_buf[0] = (total_packets_in_chain - 1) - p; // Countdown
             tx_buf[1] = (uint8_t)ops_in_packet;           // Op count
 
@@ -151,8 +151,8 @@ int batch_execute(libusb_device_handle *handle, struct rv_usb_batch *batch) {
                    ops_in_packet * CMD_SIZE);
 
             int transferred;
-            //printf("this packet has %d commands, total %d bytes long, countdown %d\n", (int)ops_in_packet, 64, tx_buf[0]);
-            libusb_bulk_transfer(handle, EP_OUT, tx_buf, 64, &transferred, 1000);
+            //printf("this packet has %d commands, total %d bytes long, countdown %d\n", (int)ops_in_packet, USB_MPS, tx_buf[0]);
+            libusb_bulk_transfer(handle, EP_OUT, tx_buf, USB_MPS, &transferred, 1000);
             
             ops_in_this_chain += ops_in_packet;
         }
@@ -160,7 +160,8 @@ int batch_execute(libusb_device_handle *handle, struct rv_usb_batch *batch) {
         // --- PHASE 2: Collect Results for this Chain ---
         size_t bytes_to_receive = chain_size * RESP_SIZE;
         size_t received = 0;
-        while (received < bytes_to_receive) {
+        int timeout = 10;
+        while (received < bytes_to_receive && timeout -- > 0) {
             int actual;
             // Place results into the correct global offset
             uint8_t *dest_ptr = ((uint8_t*)results_scratch) + (global_ops_completed * RESP_SIZE) + received;
@@ -178,7 +179,7 @@ int batch_execute(libusb_device_handle *handle, struct rv_usb_batch *batch) {
     for (size_t i = 0; i < batch->num_reads; i++) {
         *batch->reads[i].dest = results_scratch[batch->reads[i].batch_index];
 
-        LOG_DEBUG("result = %08X\n", results_scratch[batch->reads[i].batch_index]);
+        //printf("result = %08X\n", results_scratch[batch->reads[i].batch_index]);
 
     }
 
