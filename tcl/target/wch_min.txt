@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 
 # Minimal generic config for RV32IMAC MCU using RVSWD
-# No flash programming, only CPU connection and SRAM access
 
 gdb_memory_map enable
 gdb_flash_program enable
@@ -20,7 +19,6 @@ ddmi newtap rv32imac_generic cpu -irlen 1 -expected-id 0
 target create rv32imac_generic.cpu riscv -chain-position rv32imac_generic.cpu
 
 
-# SRAM work area (generic: 2KB at 0x20000000, common for RV32IMAC MCUs)
 set _SRAM_BASE 0x20000000
 set _WORKAREASIZE 0x1000  ;# 4KB, adjust for your MCU
 
@@ -28,19 +26,16 @@ set _WORKAREASIZE 0x1000  ;# 4KB, adjust for your MCU
 set _TARGETNAME $_CHIPNAME.cpu
 #target create $_TARGETNAME riscv -chain-position $_TAPNAME
 
-# Explicitly disable
 # Work area in SRAM for memory operations
 $_TARGETNAME configure -work-area-phys $_SRAM_BASE -work-area-size $_WORKAREASIZE -work-area-backup 0
 #flash bank $_CHIPNAME.flash_ ch32_sip 0x08000000 0 0 0 $_TARGETNAME
 flash bank $_CHIPNAME.flash ch32_sip 0x00000000 0 0 0 $_TARGETNAME
-#flash bank $_CHIPNAME.flash ch32_sip 0x00000000 0x10000 0 0 $_TARGETNAME
 gdb_breakpoint_override soft
 gdb_flash_program enable
 
 
 riscv set_reset_timeout_sec 2
 riscv set_enable_virt2phys off
-# Tell OpenOCD to catch the hart immediately after reset
 riscv set_command_timeout_sec 5
 
 echo "Generic RV32IMAC target ready for testing"
