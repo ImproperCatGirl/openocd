@@ -6,7 +6,9 @@
 
  #include "flash/nor/core.h"
 #include "helper/binarybuffer.h"
+#include "helper/log.h"
 #include "target/algorithm.h"
+#include <stdbool.h>
 #ifdef HAVE_CONFIG_H
  #include "config.h"
  #endif
@@ -23,6 +25,7 @@
  
  /* Bit Definitions (Adjust these to your specific POS_ names) */
  #define CTLR_LOCK       (1 << 7)
+ #define CTLR_PG           (1 << 0)
  #define CTLR_FTPG       (1 << 16)   /* Fast Page Programming Enable */
  #define CTLR_FTER          (1<<17)
  #define CTLR_PGSTRT     (1 << 21)   /* Fast Page Start */
@@ -61,7 +64,7 @@
   
   
   
- static int ch32_sip_unlock(struct flash_bank *bank)
+ static int ch32_sip_unlock(struct flash_bank *bank, bool fast)
  {
      struct target *target = bank->target;
      uint32_t ctrl;
@@ -73,10 +76,13 @@
      /* Unlock FPEC */
      target_write_u32(target, FLASH_KEYR, 0x45670123);
      target_write_u32(target, FLASH_KEYR, 0xCDEF89AB);
- 
-     /* Unlock Fast Mode */
-     target_write_u32(target, FLASH_MODEKEYR, 0x45670123);
-     target_write_u32(target, FLASH_MODEKEYR, 0xCDEF89AB);
+
+     if(fast)
+     {
+        /* Unlock Fast Mode */
+        target_write_u32(target, FLASH_MODEKEYR, 0x45670123);
+        target_write_u32(target, FLASH_MODEKEYR, 0xCDEF89AB);
+     }
  
      target_read_u32(target, FLASH_CTLR, &ctrl);
      if (ctrl & CTLR_LOCK) {
@@ -85,7 +91,7 @@
      }
      uint32_t check_ctrl;
     target_read_u32(target, FLASH_CTLR, &check_ctrl);
-    if (check_ctrl & 0x8000) {
+    if (check_ctrl & CTLR_LOCK) {
         LOG_ERROR("CRITICAL: Flash re-locked (0x%08x) before algorithm start!", check_ctrl);
     }
     
@@ -212,14 +218,13 @@ static int ch32_sip_write(struct flash_bank *bank, const uint8_t *buffer,
         count -= bytes_done;
     }
 
-    retval = ch32_sip_unlock(bank);
-    if (retval != ERROR_OK)
-        return retval;
 
     /* --- RMW LOGIC HANDLES THE REMAINDER (OR ALL IF FAST FAILED/UNALIGNED) --- */
     if (count == 0)
         return ERROR_OK;
-
+    retval = ch32_sip_unlock(bank,true);
+    if (retval != ERROR_OK)
+        return retval;
     uint32_t current_addr = (bank->base + offset) | 0x08000000;
     uint32_t bytes_remaining = count;
     const uint8_t *src = buffer;
