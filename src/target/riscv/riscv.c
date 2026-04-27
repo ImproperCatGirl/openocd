@@ -1637,10 +1637,10 @@ static int riscv_add_breakpoint(struct target *target, struct breakpoint *breakp
 		uint8_t buff[4] = { 0 };
 		buf_set_u32(buff, 0, breakpoint->length * CHAR_BIT, breakpoint->length == 4 ? ebreak() : ebreak_c());
 		/* Write the ebreak instruction. */
-		if(FLASH_BKPT)
+		struct flash_bank *c;
+		get_flash_bank_by_addr(target, breakpoint->address, false, &c);
+		if(c != NULL)
 		{
-			struct flash_bank *c;
-			get_flash_bank_by_addr(target, breakpoint->address, false, &c);
 			flash_driver_write(c,
 				buff, breakpoint->address,breakpoint->length);
 				LOG_ERROR("FLASH WRITE AT %08lX\n", breakpoint->address);
@@ -1706,11 +1706,12 @@ static int riscv_remove_breakpoint(struct target *target,
 		struct breakpoint *breakpoint)
 {
 	if (breakpoint->type == BKPT_SOFT) {
+
+		struct flash_bank *c;
+		get_flash_bank_by_addr(target, breakpoint->address, false, &c);
 		/* Write the original instruction. */
-		if(FLASH_BKPT)
+		if(c != NULL)
 		{
-			struct flash_bank *c;
-			get_flash_bank_by_addr(target, breakpoint->address, false, &c);
 			flash_driver_write(c,
 				breakpoint->orig_instr, breakpoint->address,breakpoint->length);
 				LOG_ERROR("FLASH WRITE AT %08lX\n", breakpoint->address);
