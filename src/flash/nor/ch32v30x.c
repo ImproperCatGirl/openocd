@@ -136,7 +136,7 @@
 
     init_reg_param(&reg_params[2], "a2", 32, PARAM_OUT);
     /* Calculate pages: count is bytes, stub expects 256-byte page count */
-    buf_set_u32(reg_params[2].value, 0, 32, (count + 255) / 256);
+    buf_set_u32(reg_params[2].value, 0, 32, count / 256);
 
     /* 3. Run the algorithm */
     /* No stack used (requires stub compiled with -O2) */
@@ -152,11 +152,9 @@
 
     return retval;
 }
-
-
 static int ch32_sip_write(struct flash_bank *bank, const uint8_t *buffer,
     uint32_t offset, uint32_t count)
-    {
+{
     struct target *target = bank->target;
     int retval;
 
@@ -165,49 +163,33 @@ static int ch32_sip_write(struct flash_bank *bank, const uint8_t *buffer,
         return ERROR_TARGET_NOT_HALTED;
     }
 
-    retval = ch32_sip_unlock(bank);
-    if (retval != ERROR_OK)
-        return retval;
 
-    //struct target *target = bank->target;
     struct working_area *stub_area = NULL;
     struct working_area *source_area = NULL;
-    //int retval;
+    uint32_t bytes_done = 0;
 
-    if (target->state != TARGET_HALTED) {
-        LOG_ERROR("Target not halted");
-        return ERROR_TARGET_NOT_HALTED;
-    }
-
-    retval = ch32_sip_unlock(bank);
-    if (retval != ERROR_OK)
-        return retval;
-
+    /* Check if we can use the Fast Algorithm (Aligned and at least one full page) */
     if (count >= 256 && (offset % 256 == 0)) {
+        
+        /* Calculate how many bytes can be handled in whole pages */
+        uint32_t fast_bytes_total = count & ~0xFF; // Rounds down to nearest 256
 
-        uint32_t bytes_done = 0;
-        printf("Engaging target ALGO!\n");
-
-        /* 1. PRE-ALLOCATE: Allocate areas ONCE before the loop */
-        /* Allocate space for the code stub */
         retval = target_alloc_working_area(target, sizeof(stub_bin), &stub_area);
         if (retval != ERROR_OK) goto fallback;
 
-        /* Allocate a fixed 1KB buffer for data chunks */
         retval = target_alloc_working_area(target, 1024, &source_area);
         if (retval != ERROR_OK) goto fallback;
 
-        /* 2. UPLOAD STUB: Upload the machine code ONCE */
         retval = target_write_buffer(target, stub_area->address, sizeof(stub_bin), stub_bin);
         if (retval != ERROR_OK) goto fallback;
 
-        while (bytes_done < count) {
-            uint32_t current_chunk = count - bytes_done;
+        /* MODIFIED: Loop only for the "whole page" portion of the buffer */
+        while (bytes_done < fast_bytes_total) {
+            uint32_t current_chunk = fast_bytes_total - bytes_done;
             if (current_chunk > 1024) {
                 current_chunk = 1024;
             }
 
-            /* 3. EXECUTE: Call the execution block */
             retval = ch32_write_block_fast(bank, stub_area, source_area, 
                                           buffer + bytes_done, 
                                           offset + bytes_done, 
@@ -221,21 +203,23 @@ static int ch32_sip_write(struct flash_bank *bank, const uint8_t *buffer,
         }
 
     fallback:
-        /* 4. CLEANUP: Free working areas only after the loop is done */
         if (source_area) target_free_working_area(target, source_area);
         if (stub_area) target_free_working_area(target, stub_area);
 
-        if (bytes_done >= count) {
-            return ERROR_OK;
-        }
-
-        /* Update pointers for RMW fallback if algorithm partially succeeded or failed */
+        /* Advance pointers/counters by what the fast algo actually finished */
         buffer += bytes_done;
         offset += bytes_done;
         count -= bytes_done;
     }
 
-    /* --- ORIGINAL RMW LOGIC FOR SMALL/UNALIGNED WRITES --- */
+    retval = ch32_sip_unlock(bank);
+    if (retval != ERROR_OK)
+        return retval;
+
+    /* --- RMW LOGIC HANDLES THE REMAINDER (OR ALL IF FAST FAILED/UNALIGNED) --- */
+    if (count == 0)
+        return ERROR_OK;
+
     uint32_t current_addr = (bank->base + offset) | 0x08000000;
     uint32_t bytes_remaining = count;
     const uint8_t *src = buffer;
@@ -249,8 +233,9 @@ static int ch32_sip_write(struct flash_bank *bank, const uint8_t *buffer,
         if (chunk_size > bytes_remaining)
             chunk_size = bytes_remaining;
 
-        /* Read-Modify-Write if not a full page */
+        /* Read-Modify-Write for partials */
         if (chunk_size != 256) {
+            printf("RMW activated!\n");
             retval = target_read_buffer(target, page_start, 256, page_buffer);
             if (retval != ERROR_OK) return retval;
         }
@@ -277,7 +262,6 @@ static int ch32_sip_write(struct flash_bank *bank, const uint8_t *buffer,
             } while (status & STATR_WR_BSY);
         }
 
-        /* Commit Programming */
         target_write_u32(target, FLASH_CTLR, CTLR_FTPG | CTLR_PGSTRT);
         retval = ch32_sip_wait_bsy(target, 100);
         if (retval != ERROR_OK) return retval;
@@ -293,7 +277,6 @@ static int ch32_sip_write(struct flash_bank *bank, const uint8_t *buffer,
 
     return ERROR_OK;
 }
-
 /*
  static int ch32_sip_write_(struct flash_bank *bank, const uint8_t *buffer,
     uint32_t offset, uint32_t count)
