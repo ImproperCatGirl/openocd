@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "flash/nor/core.h"
+#include "flash/nor/imp.h"
 #include <assert.h>
 #include <stdlib.h>
 #include <time.h>
@@ -38,6 +40,8 @@
 #define RISCV_TRIGGER_HIT_NOT_FOUND ((int64_t)-1)
 
 #define RISCV_HALT_GROUP_REPOLL_LIMIT 5
+
+#define FLASH_BKPT 1
 
 static uint8_t ir_dtmcontrol[4] = {DTMCONTROL};
 struct scan_field select_dtmcontrol = {
@@ -1633,7 +1637,15 @@ static int riscv_add_breakpoint(struct target *target, struct breakpoint *breakp
 		uint8_t buff[4] = { 0 };
 		buf_set_u32(buff, 0, breakpoint->length * CHAR_BIT, breakpoint->length == 4 ? ebreak() : ebreak_c());
 		/* Write the ebreak instruction. */
-		if (riscv_write_by_any_size(target, breakpoint->address, breakpoint->length, buff) != ERROR_OK) {
+		if(FLASH_BKPT)
+		{
+			struct flash_bank *c;
+			get_flash_bank_by_addr(target, breakpoint->address, false, &c);
+			flash_driver_write(c,
+				buff, breakpoint->address,breakpoint->length);
+				LOG_ERROR("FLASH WRITE AT %08lX\n", breakpoint->address);
+		}
+		else if (riscv_write_by_any_size(target, breakpoint->address, breakpoint->length, buff) != ERROR_OK) {
 			LOG_TARGET_ERROR(target, "Failed to write %d-byte breakpoint instruction at 0x%"
 					TARGET_PRIxADDR, breakpoint->length, breakpoint->address);
 			return ERROR_FAIL;
@@ -1695,7 +1707,15 @@ static int riscv_remove_breakpoint(struct target *target,
 {
 	if (breakpoint->type == BKPT_SOFT) {
 		/* Write the original instruction. */
-		if (riscv_write_by_any_size(
+		if(FLASH_BKPT)
+		{
+			struct flash_bank *c;
+			get_flash_bank_by_addr(target, breakpoint->address, false, &c);
+			flash_driver_write(c,
+				breakpoint->orig_instr, breakpoint->address,breakpoint->length);
+				LOG_ERROR("FLASH WRITE AT %08lX\n", breakpoint->address);
+		}
+		else if (riscv_write_by_any_size(
 				target, breakpoint->address, breakpoint->length, breakpoint->orig_instr) != ERROR_OK) {
 			LOG_TARGET_ERROR(target, "Failed to restore instruction for %d-byte breakpoint at "
 					"0x%" TARGET_PRIxADDR, breakpoint->length, breakpoint->address);
