@@ -110,29 +110,24 @@
      return ERROR_OK;
  }
 
-static int ch32_write_block_fast(struct flash_bank *bank, const uint8_t *buffer, uint32_t offset, uint32_t count)
+ static int ch32_write_block_fast(struct flash_bank *bank, 
+    struct working_area *stub_area,
+    struct working_area *source_area,
+    const uint8_t *buffer, 
+    uint32_t offset, 
+    uint32_t count)
 {
     struct target *target = bank->target;
-    struct working_area *stub_area;
-    struct working_area *source_area;
-    struct reg_param reg_params[4];
+    struct reg_param reg_params[3];
     uint32_t address = (bank->base + offset) | 0x08000000;
     int retval;
 
-    /* 1. Allocate RAM on the chip for code and data */
-    /* Check your .cfg for 'work-area-phys' to ensure this is in SRAM */
-    target_alloc_working_area(target, sizeof(stub_bin), &stub_area);
-    target_alloc_working_area(target, count, &source_area);
+    /* 1. Upload only the DATA chunk to the pre-allocated source area */
+    retval = target_write_buffer(target, source_area->address, count, buffer);
+    if (retval != ERROR_OK)
+    return retval;
 
-    /* 2. Upload stub and data */
-    target_write_buffer(target, stub_area->address, sizeof(stub_bin), stub_bin);
-    target_write_buffer(target, source_area->address, count, buffer);
-
-
-    struct working_area *stack_area;
-    target_alloc_working_area(target, 256, &stack_area);
-
-    /* 3. Setup registers (a0=src, a1=dest, a2=count) */
+    /* 2. Setup registers (Using your PARAM_OUT mapping) */
     init_reg_param(&reg_params[0], "a0", 32, PARAM_OUT);
     buf_set_u32(reg_params[0].value, 0, 32, source_area->address);
 
@@ -140,27 +135,24 @@ static int ch32_write_block_fast(struct flash_bank *bank, const uint8_t *buffer,
     buf_set_u32(reg_params[1].value, 0, 32, address);
 
     init_reg_param(&reg_params[2], "a2", 32, PARAM_OUT);
-    buf_set_u32(reg_params[2].value, 0, 32, count / 256);
+    /* Calculate pages: count is bytes, stub expects 256-byte page count */
+    buf_set_u32(reg_params[2].value, 0, 32, (count + 255) / 256);
 
-
-    /*init_reg_param(&reg_params[3], "sp", 32, PARAM_IN);
-    buf_set_u32(reg_params[3].value, 0, 32, stack_area->address + 256);*/
-    /* 4. Run the algorithm */
-    /* stub_area->address + length - 2 is a common way to point to the ebreak */
+    /* 3. Run the algorithm */
+    /* No stack used (requires stub compiled with -O2) */
     retval = target_run_algorithm(target, 0, NULL, 3, reg_params,
-                                  stub_area->address, 
-                                  0, // OpenOCD will find the ebreak exit point
-                                  10000, NULL);
+        stub_area->address, 
+        0, // OpenOCD handles ebreak exit
+        10000, NULL);
 
-    /* 5. Cleanup */
+    /* 4. Cleanup registers */
     destroy_reg_param(&reg_params[0]);
     destroy_reg_param(&reg_params[1]);
     destroy_reg_param(&reg_params[2]);
-    target_free_working_area(target, source_area);
-    target_free_working_area(target, stub_area);
 
     return retval;
 }
+
 
 static int ch32_sip_write(struct flash_bank *bank, const uint8_t *buffer,
     uint32_t offset, uint32_t count)
@@ -177,36 +169,70 @@ static int ch32_sip_write(struct flash_bank *bank, const uint8_t *buffer,
     if (retval != ERROR_OK)
         return retval;
 
+    //struct target *target = bank->target;
+    struct working_area *stub_area = NULL;
+    struct working_area *source_area = NULL;
+    //int retval;
+
+    if (target->state != TARGET_HALTED) {
+        LOG_ERROR("Target not halted");
+        return ERROR_TARGET_NOT_HALTED;
+    }
+
+    retval = ch32_sip_unlock(bank);
+    if (retval != ERROR_OK)
+        return retval;
+
     if (count >= 256 && (offset % 256 == 0)) {
-    //if(count){
-        printf("engaging target ALGO!\n");
-        
+
         uint32_t bytes_done = 0;
+        printf("Engaging target ALGO!\n");
+
+        /* 1. PRE-ALLOCATE: Allocate areas ONCE before the loop */
+        /* Allocate space for the code stub */
+        retval = target_alloc_working_area(target, sizeof(stub_bin), &stub_area);
+        if (retval != ERROR_OK) goto fallback;
+
+        /* Allocate a fixed 1KB buffer for data chunks */
+        retval = target_alloc_working_area(target, 1024, &source_area);
+        if (retval != ERROR_OK) goto fallback;
+
+        /* 2. UPLOAD STUB: Upload the machine code ONCE */
+        retval = target_write_buffer(target, stub_area->address, sizeof(stub_bin), stub_bin);
+        if (retval != ERROR_OK) goto fallback;
+
         while (bytes_done < count) {
-            // Process in 1KB (1024 byte) chunks
             uint32_t current_chunk = count - bytes_done;
             if (current_chunk > 1024) {
                 current_chunk = 1024;
             }
 
-            retval = ch32_write_block_fast(bank, buffer + bytes_done, offset + bytes_done, current_chunk);
+            /* 3. EXECUTE: Call the execution block */
+            retval = ch32_write_block_fast(bank, stub_area, source_area, 
+                                          buffer + bytes_done, 
+                                          offset + bytes_done, 
+                                          current_chunk);
             
             if (retval != ERROR_OK) {
-                LOG_ERROR("Fast block write failed at offset 0x%08" PRIx32 ", falling back to RMW", offset + bytes_done);
-                // Break and let the RMW logic handle the remaining 'count - bytes_done'
-                buffer += bytes_done;
-                offset += bytes_done;
-                count -= bytes_done;
+                LOG_ERROR("Fast block write failed at offset 0x%08" PRIx32, offset + bytes_done);
                 break; 
             }
-
             bytes_done += current_chunk;
         }
 
-        // If we finished the whole buffer via the algorithm, return success
+    fallback:
+        /* 4. CLEANUP: Free working areas only after the loop is done */
+        if (source_area) target_free_working_area(target, source_area);
+        if (stub_area) target_free_working_area(target, stub_area);
+
         if (bytes_done >= count) {
             return ERROR_OK;
         }
+
+        /* Update pointers for RMW fallback if algorithm partially succeeded or failed */
+        buffer += bytes_done;
+        offset += bytes_done;
+        count -= bytes_done;
     }
 
     /* --- ORIGINAL RMW LOGIC FOR SMALL/UNALIGNED WRITES --- */
