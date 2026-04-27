@@ -3,6 +3,8 @@
 # Minimal generic config for RV32IMAC MCU using RVSWD
 # No flash programming, only CPU connection and SRAM access
 
+gdb_memory_map enable
+gdb_flash_program enable
 
 # Chip name (generic, override with -set CHIPNAME=your_chip)
 if { [info exists CHIPNAME] } {
@@ -29,10 +31,12 @@ set _TARGETNAME $_CHIPNAME.cpu
 # Explicitly disable
 # Work area in SRAM for memory operations
 $_TARGETNAME configure -work-area-phys $_SRAM_BASE -work-area-size $_WORKAREASIZE -work-area-backup 0
-#flash bank $_CHIPNAME.flash ch32_sip 0x08000000 0 0 0 $_TARGETNAME
-#flash bank $_CHIPNAME.flash ch32_sip 0x00000000 0 0 0 $_TARGETNAME
-flash bank $_CHIPNAME.flash ch32_sip 0x00000000 0x10000 0 0 $_TARGETNAME
-gdb_memory_map enable
+#flash bank $_CHIPNAME.flash_ ch32_sip 0x08000000 0 0 0 $_TARGETNAME
+flash bank $_CHIPNAME.flash ch32_sip 0x00000000 0 0 0 $_TARGETNAME
+#flash bank $_CHIPNAME.flash ch32_sip 0x00000000 0x10000 0 0 $_TARGETNAME
+gdb_breakpoint_override soft
+gdb_flash_program enable
+
 
 riscv set_reset_timeout_sec 2
 riscv set_enable_virt2phys off
