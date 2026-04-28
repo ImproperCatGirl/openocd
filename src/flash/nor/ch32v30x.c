@@ -173,8 +173,6 @@ int ch32_write_flash_16bit(struct flash_bank *bank, uint32_t addr, uint16_t val)
     target_read_u32(bank->target, FLASH_CTLR, &ctrl_reg);
     target_write_u32(bank->target, FLASH_CTLR, ctrl_reg & ~CTLR_PG);
 
-    target_write_u32(bank->target, FLASH_CTLR, ctrl_reg & ~CTLR_PG);
-
     return ERROR_OK;
 }
 static int ch32_sip_write(struct flash_bank *bank, const uint8_t *buffer,
@@ -307,101 +305,6 @@ static int ch32_sip_write(struct flash_bank *bank, const uint8_t *buffer,
 
     return ERROR_OK;
 }
-/*
- static int ch32_sip_write_(struct flash_bank *bank, const uint8_t *buffer,
-    uint32_t offset, uint32_t count)
-    {
-    struct target *target = bank->target;
-    int retval;
-
-    if (target->state != TARGET_HALTED) {
-        LOG_ERROR("Target not halted");
-        return ERROR_TARGET_NOT_HALTED;
-    }
-
-    retval = ch32_sip_unlock(bank);
-    if (retval != ERROR_OK)
-        return retval;
-
-    // * GDB might send data to 0x00000000. We must ensure the address used 
-    // * for the FLASH_ADDR register starts with 0x08... 
-    
-    uint32_t current_addr = (bank->base + offset) | 0x08000000;
-    printf("ADDR = %08X\n", current_addr);
-    uint32_t bytes_remaining = count;
-    const uint8_t *src = buffer;
-
-    uint8_t page_buffer[256];
-
-    while (bytes_remaining > 0) {
-        uint32_t page_start = current_addr & ~0xFF;
-        uint32_t offset_in_page = current_addr & 0xFF;
-        uint32_t chunk_size = 256 - offset_in_page;
-
-        if (chunk_size > bytes_remaining)
-            chunk_size = bytes_remaining;
-
-        // * READ-MODIFY-WRITE Logic:
-        // If we aren't writing a perfect 256B aligned page, we must 
-        // preserve the existing data (or the 0xE339 erase pattern).
-        //
-        if (chunk_size != 256) {
-            / Read existing 256B page from target 
-            retval = target_read_buffer(target, page_start, 256, page_buffer);
-            if (retval != ERROR_OK)
-                return retval;
-        }
-
-        // Patch the buffer with new data 
-        memcpy(page_buffer + offset_in_page, src, chunk_size);
-
-        // 1. FAST PAGE ERASE (FTER) 
-        target_write_u32(target, FLASH_CTLR, CTLR_FTER);
-        target_write_u32(target, FLASH_ADDR, page_start);
-        target_write_u32(target, FLASH_CTLR, CTLR_FTER | CTLR_STRT);
-
-        retval = ch32_sip_wait_bsy(target, 100);
-        if (retval != ERROR_OK) return retval;
-
-        target_write_u32(target, FLASH_STATR, STATR_EOP);
-
-        // 2. FAST PAGE PROGRAM (FTPG) 
-        target_write_u32(target, FLASH_CTLR, CTLR_FTPG);
-
-        // Write exactly 64 words (256 bytes) from our RAM buffer 
-        for (int i = 0; i < 256; i += 4) {
-            uint32_t word;
-            memcpy(&word, page_buffer + i, 4);
-
-            target_write_u32(target, page_start + i, word);
-
-            // Wait for Word Buffer (WR_BSY) 
-            uint32_t status;
-            do {
-                target_read_u32(target, FLASH_STATR, &status);
-            } while (status & STATR_WR_BSY);
-        }
-
-        // Commit Programming 
-        target_write_u32(target, FLASH_CTLR, CTLR_FTPG | CTLR_PGSTRT);
-
-        retval = ch32_sip_wait_bsy(target, 100);
-        if (retval != ERROR_OK) return retval;
-
-        // Clear Status and Disable Modes 
-        target_write_u32(target, FLASH_STATR, STATR_EOP);
-        target_write_u32(target, FLASH_CTLR, 0);
-
-        // Advance pointers 
-        bytes_remaining -= chunk_size;
-        src += chunk_size;
-        current_addr += chunk_size;
-        
-        keep_alive();
-    }
-
-    return ERROR_OK;
-}*/
  
  static int ch32_sip_erase(struct flash_bank *bank, unsigned int first, unsigned int last)
  {
