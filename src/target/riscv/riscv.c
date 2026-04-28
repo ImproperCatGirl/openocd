@@ -1643,7 +1643,6 @@ static int riscv_add_breakpoint(struct target *target, struct breakpoint *breakp
 		{
 			flash_driver_write(c,
 				buff, breakpoint->address,breakpoint->length);
-				LOG_ERROR("FLASH WRITE AT %08lX\n", breakpoint->address);
 		}
 		else if (riscv_write_by_any_size(target, breakpoint->address, breakpoint->length, buff) != ERROR_OK) {
 			LOG_TARGET_ERROR(target, "Failed to write %d-byte breakpoint instruction at 0x%"
@@ -1714,7 +1713,6 @@ static int riscv_remove_breakpoint(struct target *target,
 		{
 			flash_driver_write(c,
 				breakpoint->orig_instr, breakpoint->address,breakpoint->length);
-				LOG_ERROR("FLASH WRITE AT %08lX\n", breakpoint->address);
 		}
 		else if (riscv_write_by_any_size(
 				target, breakpoint->address, breakpoint->length, breakpoint->orig_instr) != ERROR_OK) {

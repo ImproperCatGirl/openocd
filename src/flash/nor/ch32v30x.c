@@ -240,7 +240,7 @@ static int ch32_sip_write(struct flash_bank *bank, const uint8_t *buffer,
     if (count == 0)
         return ERROR_OK;
 
-    if(count == 2)
+    if(count == 2 && offset % 2 == 0)
     {
         ch32_sip_unlock(bank, false);
         return ch32_write_flash_16bit(bank, offset | 0x08000000, (uint16_t)((buffer[1] << 8) | buffer[0]));
