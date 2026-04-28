@@ -158,6 +158,25 @@
 
     return retval;
 }
+
+int ch32_write_flash_16bit(struct flash_bank *bank, uint32_t addr, uint16_t val) {
+    uint32_t ctrl_reg;
+
+    // 2. Enable Standard Programming (PG Bit)
+    target_read_u32(bank->target, FLASH_CTLR, &ctrl_reg);
+    target_write_u32(bank->target, FLASH_CTLR, ctrl_reg | CTLR_PG);
+
+    target_write_u16(bank->target, addr, val);
+     ch32_sip_wait_bsy(bank->target, 100);
+
+    // 3. Clean up (Disable PG)
+    target_read_u32(bank->target, FLASH_CTLR, &ctrl_reg);
+    target_write_u32(bank->target, FLASH_CTLR, ctrl_reg & ~CTLR_PG);
+
+    target_write_u32(bank->target, FLASH_CTLR, ctrl_reg & ~CTLR_PG);
+
+    return ERROR_OK;
+}
 static int ch32_sip_write(struct flash_bank *bank, const uint8_t *buffer,
     uint32_t offset, uint32_t count)
 {
@@ -222,6 +241,13 @@ static int ch32_sip_write(struct flash_bank *bank, const uint8_t *buffer,
     /* --- RMW LOGIC HANDLES THE REMAINDER (OR ALL IF FAST FAILED/UNALIGNED) --- */
     if (count == 0)
         return ERROR_OK;
+
+    if(count == 2)
+    {
+        ch32_sip_unlock(bank, false);
+        return ch32_write_flash_16bit(bank, offset | 0x08000000, (uint16_t)((buffer[1] << 8) | buffer[0]));
+        
+    }
     retval = ch32_sip_unlock(bank,true);
     if (retval != ERROR_OK)
         return retval;
@@ -240,7 +266,6 @@ static int ch32_sip_write(struct flash_bank *bank, const uint8_t *buffer,
 
         /* Read-Modify-Write for partials */
         if (chunk_size != 256) {
-            printf("RMW activated!\n");
             retval = target_read_buffer(target, page_start, 256, page_buffer);
             if (retval != ERROR_OK) return retval;
         }
