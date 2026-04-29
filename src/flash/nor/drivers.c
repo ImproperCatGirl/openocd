@@ -97,6 +97,7 @@ static const struct flash_driver * const flash_drivers[] = {
 	&xmc1xxx_flash,
 	&xmc4xxx_flash,
 	&ch32_sip_flash,
+	&ch32h417_flash,
 };
 
 const struct flash_driver *flash_driver_find_by_name(const char *name)
