@@ -5163,8 +5163,9 @@ static int dm013_select_hart(struct target *target, int hart_index)
 	dm013_info_t *dm = get_dm(target);
 	if (!dm)
 		return ERROR_FAIL;
-	if (hart_index == dm->current_hartid)
-		return ERROR_OK;
+	//if (hart_index == dm->current_hartid)
+		//return ERROR_OK;
+
 
 	/* `hartsel` should not be changed if `abstractcs.busy` is set. */
 	int result = wait_for_idle_if_needed(target);
