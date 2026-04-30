@@ -2002,6 +2002,7 @@ static int examine(struct target *target)
 	target->state = TARGET_UNKNOWN;
 	target->debug_reason = DBG_REASON_UNDEFINED;
 
+	info->index = target->coreid;
 	/* Don't need to select dbus, since the first thing we do is read dtmcontrol. */
 	LOG_TARGET_DEBUG(target, "dbgbase=0x%x", target->dbgbase);
 
@@ -2021,7 +2022,6 @@ static int examine(struct target *target)
 					get_field32(dtmcontrol, DTM_DTMCS_VERSION), dtmcontrol);
 			return ERROR_FAIL;
 		}
-			info->index = target->coreid;
 		info->abits = get_field(dtmcontrol, DTM_DTMCS_ABITS);
 		info->dtmcs_idle = get_field(dtmcontrol, DTM_DTMCS_IDLE);
 
