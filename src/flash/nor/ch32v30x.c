@@ -318,7 +318,7 @@ static int ch32_sip_write(struct flash_bank *bank, const uint8_t *buffer,
  static int ch32_sip_probe(struct flash_bank *bank)
  {
      /* Setup bank info - Adjust size based on your specific chip */
-     bank->size = 64 * 1024; 
+     bank->size = 480 * 1024; 
      bank->num_sectors = bank->size / 1024;
      bank->sectors = alloc_block_array(0, 1024, bank->num_sectors);
      bank->erased_value = 0xFF;

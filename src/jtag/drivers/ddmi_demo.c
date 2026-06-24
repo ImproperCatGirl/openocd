@@ -104,7 +104,6 @@ int batch_add_op(struct rv_usb_batch *batch, char type, uint32_t addr, uint32_t 
 // ------------------------- Read / Write Wrappers -------------------------
 static int ddmi_usb_dmi_read(uint8_t addr, uint32_t *value)
 {
-    LOG_DEBUG("USB DMI read 0x%08x", addr);
     batch_add_read(&r_w_buffer, addr, value);
     //usb_dmi_op(ddmi_usb_priv.handle, 'r', addr, 0x0, value);
     return 0;
@@ -115,7 +114,6 @@ static int ddmi_usb_dmi_write(uint8_t addr, uint32_t value)
 {
     batch_add_op(&r_w_buffer, 'w', addr, value);
     // YOUR REAL PIO IMPLEMENTATION HERE
-    LOG_DEBUG("USB DMI write 0x%08x=0x%08x", addr, value);
     return 0;
 }
 static uint32_t results_scratch[MAX_BATCH];
