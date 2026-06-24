@@ -88,7 +88,8 @@ NOR_DRIVERS = \
 	%D%/xmc4xxx.c \
 	%D%/hpm_xpi.c \
 	%D%/ch32v30x.c \
-	%D%/ch32h417.c
+	%D%/ch32h417.c \
+	%D%/ch32x035.c
 
 NORHEADERS = \
 	%D%/artery.h \
@@ -106,4 +107,5 @@ NORHEADERS = \
 	%D%/spi.h \
 	%D%/stm32l4x.h \
 	%D%/stmqspi.h \
-	%D%/msp432.h
+	%D%/msp432.h \
+	%D%/ch32x035_flash_algo_blob.h
