@@ -25,7 +25,7 @@
  #define CH32X035_FLASH_BASE      0x08000000u
  #define CH32X035_FLASH_SIZE      0x0000F800u
  #define CH32X035_PAGE_SIZE       256u
- #define CH32X035_SOURCE_SIZE     256u
+ #define CH32X035_SOURCE_SIZE     1024u
  
  #define FLASH_REG_BASE           0x40022000u
  #define FLASH_KEYR               0x40022004u
@@ -191,7 +191,8 @@
  static int ch32x035_run_program_stub(struct target *target,
 					  struct working_area *stub_area,
 					  struct working_area *source_area,
-					  uint32_t page_offset)
+					  uint32_t page_offset,
+					  uint32_t byte_count)
  {
 	 struct reg_param reg_params[5];
 	 int retval;
@@ -206,7 +207,7 @@
 	 buf_set_u32(reg_params[2].value, 0, 32, source_area->address);
  
 	 init_reg_param(&reg_params[3], "a3", 32, PARAM_OUT);
-	 buf_set_u32(reg_params[3].value, 0, 32, CH32X035_PAGE_SIZE);
+	 buf_set_u32(reg_params[3].value, 0, 32, byte_count);
  
 	 init_reg_param(&reg_params[4], "a4", 32, PARAM_OUT);
 	 buf_set_u32(reg_params[4].value, 0, 32, 0);
@@ -259,11 +260,17 @@
 		 uint32_t chunk = CH32X035_PAGE_SIZE - in_page;
 		 const uint8_t *page_src = buffer;
 		 uint32_t page_addr = base + page_offset;
+		 uint32_t program_bytes = CH32X035_PAGE_SIZE;
  
 		 if (chunk > count)
 			 chunk = count;
  
-		 if (in_page != 0 || chunk != CH32X035_PAGE_SIZE) {
+		 if (in_page == 0 && count >= CH32X035_PAGE_SIZE) {
+			 program_bytes = count & ~(CH32X035_PAGE_SIZE - 1u);
+			 if (program_bytes > CH32X035_SOURCE_SIZE)
+				 program_bytes = CH32X035_SOURCE_SIZE;
+			 chunk = program_bytes;
+		 } else {
 			 retval = target_read_buffer(target, page_addr,
 							 CH32X035_PAGE_SIZE, page_buffer);
 			 if (retval != ERROR_OK)
@@ -273,19 +280,23 @@
 			 page_src = page_buffer;
 		 }
  
-		 LOG_DEBUG("CH32X035 erase/program page offset 0x%08" PRIx32, page_offset);
+		 LOG_DEBUG("CH32X035 erase/program offset 0x%08" PRIx32
+			   ", %" PRIu32 " bytes", page_offset, program_bytes);
  
-		 retval = ch32x035_erase_page(target, page_addr);
-		 if (retval != ERROR_OK)
-			 goto out;
+		 for (uint32_t erase_off = 0; erase_off < program_bytes;
+			  erase_off += CH32X035_PAGE_SIZE) {
+			 retval = ch32x035_erase_page(target, page_addr + erase_off);
+			 if (retval != ERROR_OK)
+				 goto out;
+		 }
  
 		 retval = target_write_buffer(target, source_area->address,
-						  CH32X035_PAGE_SIZE, page_src);
+						  program_bytes, page_src);
 		 if (retval != ERROR_OK)
 			 goto out;
  
 		 retval = ch32x035_run_program_stub(target, stub_area, source_area,
-							page_offset);
+							page_offset, program_bytes);
 		 if (retval != ERROR_OK)
 			 goto out;
  
