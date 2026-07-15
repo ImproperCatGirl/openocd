@@ -4,6 +4,7 @@
 #define OPENOCD_TARGET_RISCV_RISCV_H
 
 struct riscv_program;
+struct riscv_dmi_backend_ops;
 
 #include <stdint.h>
 #include "opcodes.h"
@@ -169,6 +170,7 @@ struct riscv_info {
 	unsigned int common_magic;
 
 	unsigned int dtm_version;
+	const struct riscv_dmi_backend_ops *dmi_backend;
 
 	struct command_context *cmd_ctx;
 	void *version_specific;

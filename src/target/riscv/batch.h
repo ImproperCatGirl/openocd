@@ -7,6 +7,8 @@
 #include "jtag/jtag.h"
 #include "riscv.h"
 
+struct riscv_dmi_backend_ops;
+
 enum riscv_scan_type {
 	RISCV_SCAN_TYPE_INVALID,
 	RISCV_SCAN_TYPE_NOP,
@@ -120,38 +122,7 @@ static inline int riscv_scan_increase_delay(struct riscv_scan_delays *delays,
 	return ERROR_OK;
 }
 
-
-typedef enum {
-    RV_OP_INVALID = 0,
-    RV_OP_READ,
-    RV_OP_WRITE,
-} ddmi_opcode_t;
-
-typedef struct {
-    ddmi_opcode_t opcode;
-    union {
-        struct {
-            unsigned int addr;
-            uint32_t data_from_target; // Result of read
-        } read;
-        struct {
-            unsigned int addr;
-            uint32_t data_to_target;   // Value to write
-        } write;
-    } params;
-} ddmi_op_t;
-
-
-typedef struct {
-    size_t allocated_ops;
-    size_t used_ops;
-
-    ddmi_op_t *ops;
-
-    size_t *read_keys;
-    size_t read_keys_used;
-} ddmi_batch_t;
-
+struct riscv_dmi_direct_batch;
 
 /* A batch of multiple JTAG scans, which are grouped together to avoid the
  * overhead of some JTAG adapters when sending single commands.  This is
@@ -159,6 +130,7 @@ typedef struct {
  * fast. */
 struct riscv_batch {
 	struct target *target;
+	const struct riscv_dmi_backend_ops *backend;
 
 	size_t allocated_scans;
 	size_t used_scans;
@@ -192,7 +164,8 @@ struct riscv_batch {
 	 * Only valid when `was_run` is set.
 	 */
 	unsigned int last_scan_delay;
-	ddmi_batch_t* ddmi_batch;
+	bool finalized;
+	struct riscv_dmi_direct_batch *direct_batch;
 };
 
 
@@ -204,16 +177,16 @@ void riscv_batch_free(struct riscv_batch *batch);
 /* Checks to see if this batch is full. */
 bool riscv_batch_full(struct riscv_batch *batch);
 
-/* Executes this batch of JTAG DTM DMI scans, starting form "start" scan.
+/* Executes this batch of DMI operations, starting from "start" operation.
  *
  * If batch is run for the first time, it is expected that "start" is zero.
- * It is expected that the batch ends with a DMI NOP operation.
  *
- * "idle_counts" specifies the number of JTAG Run-Test-Idle cycles to add
- * after each scan depending on the delay class of the scan.
+ * "idle_counts" specifies the number of idle cycles to add after each DMI
+ * operation depending on the delay class of the operation, if the backend
+ * uses idle cycles.
  *
  * If "resets_delays" is true, the algorithm will stop inserting idle cycles
- * (JTAG Run-Test-Idle) after "reset_delays_after" number of scans is
+ * after "reset_delays_after" number of operations is
  * performed.  This is useful for stress-testing of RISC-V algorithms in
  * OpenOCD that are based on batches.
  */
@@ -221,8 +194,6 @@ int riscv_batch_run_from(struct riscv_batch *batch, size_t start_idx,
 		const struct riscv_scan_delays *delays, bool resets_delays,
 		size_t reset_delays_after);
 
-
-int ddmi_batch_run(struct riscv_batch *batch);
 
 /* Get the number of scans successfully executed form this batch. */
 size_t riscv_batch_finished_scans(const struct riscv_batch *batch);
@@ -235,11 +206,8 @@ static inline void
 riscv_batch_add_dm_write(struct riscv_batch *batch, uint32_t address, uint32_t data,
 	bool read_back, enum riscv_scan_delay_class delay_type)
 {
-	/*return riscv_batch_add_dmi_write(batch,
-			riscv_get_dmi_address(batch->target, address), data,
-			read_back, delay_type);*/
 	return riscv_batch_add_dmi_write(batch,
-		address, data,
+			riscv_get_dmi_address(batch->target, address), data,
 		read_back, delay_type);
 }
 
@@ -253,17 +221,12 @@ static inline size_t
 riscv_batch_add_dm_read(struct riscv_batch *batch, uint32_t address,
 		enum riscv_scan_delay_class delay_type)
 {
-	/*return riscv_batch_add_dmi_read(batch,
-			riscv_get_dmi_address(batch->target, address), delay_type);*/
 	return riscv_batch_add_dmi_read(batch,
-		address, delay_type);
+			riscv_get_dmi_address(batch->target, address), delay_type);
 }
 
 uint32_t riscv_batch_get_dmi_read_op(const struct riscv_batch *batch, size_t key);
 uint32_t riscv_batch_get_dmi_read_data(const struct riscv_batch *batch, size_t key);
-
-/* Scans in a NOP. */
-void riscv_batch_add_nop(struct riscv_batch *batch);
 
 /* Returns the number of available scans. */
 size_t riscv_batch_available_scans(struct riscv_batch *batch);

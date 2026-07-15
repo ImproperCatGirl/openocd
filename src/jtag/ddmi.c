@@ -31,14 +31,14 @@ void ddmi_batch_exec(void)
 }
 
 // Your dummy implementations (replace with real PIO/USB)
-static int dummy_dmi_read(uint8_t address, uint32_t *value)
+static int dummy_dmi_read(uint32_t address, uint32_t *value)
 {
     LOG_WARNING("dummy DMI read 0x%08x", address);
     *value = 0xdeadbeef;
     return ERROR_OK;
 }
 
-static int dummy_dmi_write(uint8_t address, uint32_t value)
+static int dummy_dmi_write(uint32_t address, uint32_t value)
 {
     LOG_WARNING("dummy DMI write 0x%08x=0x%08x", address, value);
     return ERROR_OK;

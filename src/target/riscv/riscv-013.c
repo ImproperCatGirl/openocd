@@ -5,7 +5,6 @@
  * latest draft.
  */
 
-#include "transport/transport.h"
 #include <assert.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -33,6 +32,7 @@
 #include "program.h"
 #include "batch.h"
 #include "debug_reg_printer.h"
+#include "dmi.h"
 #include "field_helpers.h"
 
 static int riscv013_on_step_or_resume(struct target *target, bool step);
@@ -404,47 +404,11 @@ static uint32_t set_dmcontrol_hartsel(uint32_t initial, int hart_index)
 	return initial;
 }
 
-/*** Utility functions. ***/
-
-static void select_dmi(struct jtag_tap *tap)
-{
-	if(transport_is_ddmi())	return;
-	if (bscan_tunnel_ir_width != 0) {
-		select_dmi_via_bscan(tap);
-		return;
-	}
-	if (!tap->enabled)
-		LOG_ERROR("BUG: Target's TAP '%s' is disabled!", jtag_tap_name(tap));
-
-	bool need_ir_scan = false;
-	/* FIXME: make "tap" a const pointer. */
-	for (struct jtag_tap *other_tap = jtag_tap_next_enabled(NULL);
-			other_tap; other_tap = jtag_tap_next_enabled(other_tap)) {
-		if (other_tap != tap) {
-			/* Different TAP than ours - check if it is in bypass */
-			if (!other_tap->bypass) {
-				need_ir_scan = true;
-				break;
-			}
-		} else {
-			/* Our TAP - check if the correct instruction is already loaded */
-			if (!buf_eq(tap->cur_instr, select_dbus.out_value, tap->ir_length)) {
-				need_ir_scan = true;
-				break;
-			}
-		}
-	}
-
-	if (need_ir_scan)
-		jtag_add_ir_scan(tap, &select_dbus, TAP_IDLE);
-}
-
 static int increase_dmi_busy_delay(struct target *target)
 {
 	RISCV013_INFO(info);
 
-	int res = dtmcs_scan(target->tap, DTM_DTMCS_DMIRESET,
-			NULL /* discard result */);
+	int res = riscv_dmi_reset(target);
 	if (res != ERROR_OK)
 		return res;
 
@@ -2036,27 +2000,14 @@ static int examine(struct target *target)
 	target->debug_reason = DBG_REASON_UNDEFINED;
 
 	info->index = target->coreid;
-	/* Don't need to select dbus, since the first thing we do is read dtmcontrol. */
 	LOG_TARGET_DEBUG(target, "dbgbase=0x%x", target->dbgbase);
 
-	if(transport_is_jtag())
-	{
-		uint32_t dtmcontrol;
-		if (dtmcs_scan(target->tap, 0, &dtmcontrol) != ERROR_OK || dtmcontrol == 0) {
-			LOG_TARGET_ERROR(target, "Could not scan dtmcontrol. Check JTAG connectivity/board power.");
-			return ERROR_FAIL;
-		}
+	struct riscv_dmi_info dmi_info;
+	if (riscv_dmi_get_info(target, &dmi_info) != ERROR_OK)
+		return ERROR_FAIL;
 
-		LOG_TARGET_DEBUG(target, "dtmcontrol=0x%x", dtmcontrol);
-		LOG_DEBUG_REG(target, DTM_DTMCS, dtmcontrol);
-
-		if (get_field(dtmcontrol, DTM_DTMCS_VERSION) != 1) {
-			LOG_TARGET_ERROR(target, "Unsupported DTM version %" PRIu32 ". (dtmcontrol=0x%" PRIx32 ")",
-					get_field32(dtmcontrol, DTM_DTMCS_VERSION), dtmcontrol);
-			return ERROR_FAIL;
-		}
-		info->abits = get_field(dtmcontrol, DTM_DTMCS_ABITS);
-		info->dtmcs_idle = get_field(dtmcontrol, DTM_DTMCS_IDLE);
+	info->abits = dmi_info.abits;
+	info->dtmcs_idle = dmi_info.idle;
 
 	if (info->abits > RISCV013_DTMCS_ABITS_MAX) {
 		/* Max. address width given by the debug specification is exceeded */
@@ -2065,32 +2016,30 @@ static int examine(struct target *target)
 		LOG_TARGET_ERROR(target, " found dtmcs.abits = %d; maximum is abits = %d.",
 			info->abits, RISCV013_DTMCS_ABITS_MAX);
 		return ERROR_FAIL;
-		}
+	}
 
-		if (info->abits == 0) {
-			LOG_TARGET_ERROR(target,
-					"dtmcs.abits is zero. Check JTAG connectivity/board power");
-			return ERROR_FAIL;
-		}
-		if (info->abits < RISCV013_DTMCS_ABITS_MIN) {
-			/* The requirement for minimum DMI address width of 7 bits is part of
-			* the RISC-V Debug spec since Jan-20-2017 (commit 03df6ee7). However,
-			* implementations exist that implement narrower DMI address. For example
-			* Spike as of Q1/2025 uses dmi.abits = 6.
-			*
-			* For that reason, warn the user but continue.
-			*/
-			LOG_TARGET_WARNING(target, "The target's debug bus (DMI) address width is "
-				"lower than the minimum:");
-			LOG_TARGET_WARNING(target, " found dtmcs.abits = %d; minimum is abits = %d.",
-				info->abits, RISCV013_DTMCS_ABITS_MIN);
-		}
+	if (info->abits == 0) {
+		LOG_TARGET_ERROR(target,
+				"The target's debug bus (DMI) address width is zero.");
+		return ERROR_FAIL;
+	}
+	if (info->abits < RISCV013_DTMCS_ABITS_MIN) {
+		/* The requirement for minimum DMI address width of 7 bits is part of
+		 * the RISC-V Debug spec since Jan-20-2017 (commit 03df6ee7). However,
+		 * implementations exist that implement narrower DMI address. For example
+		 * Spike as of Q1/2025 uses dmi.abits = 6.
+		 *
+		 * For that reason, warn the user but continue.
+		 */
+		LOG_TARGET_WARNING(target, "The target's debug bus (DMI) address width is "
+			"lower than the minimum:");
+		LOG_TARGET_WARNING(target, " found dtmcs.abits = %d; minimum is abits = %d.",
+			info->abits, RISCV013_DTMCS_ABITS_MIN);
+	}
 
 	if (check_dbgbase_exists(target) != ERROR_OK) {
 		LOG_TARGET_ERROR(target, "Could not find debug module with DMI base address (dbgbase) = 0x%x", target->dbgbase);
 		return ERROR_FAIL;
-	}
-
 	}
 
 	int result = examine_dm(target);
@@ -2562,24 +2511,14 @@ static int sb_write_address(struct target *target, target_addr_t address,
 
 static int batch_run(struct target *target, struct riscv_batch *batch)
 {
-	if(transport_is_ddmi())
-	{
-		ddmi_batch_run(batch);
-		return 0;
-	}
 	RISCV_INFO(r);
 	RISCV013_INFO(info);
-	select_dmi(target->tap);
-	riscv_batch_add_nop(batch);
-	const int result = riscv_batch_run_from(batch, 0, &info->learned_delays,
+	int result = riscv_batch_run_from(batch, 0, &info->learned_delays,
 			/*resets_delays*/  r->reset_delays_wait >= 0,
 			r->reset_delays_wait);
 	if (result != ERROR_OK)
 		return result;
-	/* TODO: To use `riscv_batch_finished_scans()` here, it is needed for
-	 * all scans to not discard input, meaning
-	 * "riscv_batch_add_dm_write(..., false)" should not be used. */
-	const size_t finished_scans = batch->used_scans;
+	const size_t finished_scans = riscv_batch_finished_scans(batch);
 	decrement_reset_delays_counter(target, finished_scans);
 	if (riscv_batch_was_batch_busy(batch))
 		return increase_dmi_busy_delay(target);
@@ -2591,14 +2530,7 @@ static int batch_run(struct target *target, struct riscv_batch *batch)
  */
 static int batch_run_timeout(struct target *target, struct riscv_batch *batch)
 {
-	if(transport_is_ddmi())
-	{
-		ddmi_batch_run(batch);
-		return 0;
-	}
 	RISCV013_INFO(info);
-	select_dmi(target->tap);
-	riscv_batch_add_nop(batch);
 
 	size_t finished_scans = 0;
 	int64_t then = timeval_ms() + 1000 * riscv_get_command_timeout_sec();
@@ -2618,7 +2550,6 @@ static int batch_run_timeout(struct target *target, struct riscv_batch *batch)
 		decrement_reset_delays_counter(target, new_finished_scans - finished_scans);
 		finished_scans = new_finished_scans;
 		if (!riscv_batch_was_batch_busy(batch)) {
-			assert(finished_scans == batch->used_scans);
 			return ERROR_OK;
 		}
 		result = increase_dmi_busy_delay(target);
@@ -2966,9 +2897,9 @@ static int init_target(struct command_context *cmd_ctx,
 static int assert_reset(struct target *target)
 {
 	RISCV013_INFO(info);
-	int result;
-
-	select_dmi(target->tap);
+	int result = riscv_dmi_prepare_access(target);
+	if (result != ERROR_OK)
+		return result;
 
 	if (target_has_event_action(target, TARGET_EVENT_RESET_ASSERT)) {
 		/* Run the user-supplied script if there is one. */
@@ -3020,9 +2951,10 @@ static int deassert_reset(struct target *target)
 	dm013_info_t *dm = get_dm(target);
 	if (!dm)
 		return ERROR_FAIL;
-	int result;
 
-	select_dmi(target->tap);
+	int result = riscv_dmi_prepare_access(target);
+	if (result != ERROR_OK)
+		return result;
 	/* Clear the reset, but make sure haltreq is still set */
 	uint32_t control = 0;
 	control = set_field(control, DM_DMCONTROL_DMACTIVE, 1);
@@ -4509,7 +4441,8 @@ read_memory_progbuf(struct target *target, const struct riscv_mem_access_args ar
 {
 	assert(riscv_mem_access_is_read(args));
 
-	select_dmi(target->tap);
+	if (riscv_dmi_prepare_access(target) != ERROR_OK)
+		return mem_access_result(MEM_ACCESS_FAILED);
 	memset(args.read_buffer, 0, args.count * args.size);
 
 	if (execute_autofence(target) != ERROR_OK)
