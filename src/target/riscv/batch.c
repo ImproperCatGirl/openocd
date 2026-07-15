@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include "transport/transport.h"
 #ifdef HAVE_CONFIG_H
 #include "config.h"
 #endif
@@ -8,17 +7,9 @@
 #include "batch.h"
 #include "debug_defines.h"
 #include "debug_reg_printer.h"
+#include "dmi.h"
 #include "riscv.h"
 #include "field_helpers.h"
-
-#include "jtag/ddmi.h"
-
-// TODO: DTM_DMI_MAX_ADDRESS_LENGTH should be reduced to 32 (per the debug spec)
-#define DTM_DMI_MAX_ADDRESS_LENGTH	((1<<DTM_DTMCS_ABITS_LENGTH)-1)
-#define DMI_SCAN_MAX_BIT_LENGTH (DTM_DMI_MAX_ADDRESS_LENGTH + DTM_DMI_DATA_LENGTH + DTM_DMI_OP_LENGTH)
-
-#define DMI_SCAN_BUF_SIZE (DIV_ROUND_UP(DMI_SCAN_MAX_BIT_LENGTH, 8))
-
 
 #define DTM_DMI_MAX_ADDRESS_LENGTH	((1<<DTM_DTMCS_ABITS_LENGTH)-1)
 #define DMI_SCAN_MAX_BIT_LENGTH (DTM_DMI_MAX_ADDRESS_LENGTH + DTM_DMI_DATA_LENGTH + DTM_DMI_OP_LENGTH)
@@ -26,6 +17,34 @@
 
 /* Reserve extra room in the batch (needed for the last NOP operation) */
 #define BATCH_RESERVED_SCANS 1
+
+enum riscv_dmi_direct_opcode {
+	RV_OP_INVALID = 0,
+	RV_OP_READ,
+	RV_OP_WRITE,
+};
+
+struct riscv_dmi_direct_op {
+	enum riscv_dmi_direct_opcode opcode;
+	union {
+		struct {
+			unsigned int addr;
+			uint32_t data_from_target;
+		} read;
+		struct {
+			unsigned int addr;
+			uint32_t data_to_target;
+		} write;
+	} params;
+};
+
+struct riscv_dmi_direct_batch {
+	size_t allocated_ops;
+	size_t used_ops;
+	struct riscv_dmi_direct_op *ops;
+	size_t *read_keys;
+	size_t read_keys_used;
+};
 
 static unsigned int get_dmi_scan_length(const struct target *target)
 {
@@ -36,29 +55,107 @@ static unsigned int get_dmi_scan_length(const struct target *target)
 	return abits + DTM_DMI_DATA_LENGTH + DTM_DMI_OP_LENGTH;
 }
 
-struct riscv_batch *riscv_batch_alloc(struct target *target, size_t scans)
+static void riscv_batch_add_nop_jtag(struct riscv_batch *batch);
+
+static int riscv_dmi_get_info_jtag(struct target *target, struct riscv_dmi_info *info)
 {
-	if (transport_is_ddmi()) {
-		// 1. Allocate the main wrapper
-		struct riscv_batch *batch = calloc(1, sizeof(*batch));
-		if (!batch) return NULL;
-
-		// 2. Allocate the actual DDMI container 
-		batch->ddmi_batch = calloc(1, sizeof(*(batch->ddmi_batch)));
-		if (!batch->ddmi_batch) {
-			free(batch);
-			return NULL;
-		}
-
-		batch->ddmi_batch->allocated_ops = scans;
-		
-		// 3. Allocate arrays inside the DDMI container
-		batch->ddmi_batch->ops = calloc(scans, sizeof(*(batch->ddmi_batch->ops)));
-		
-		batch->ddmi_batch->read_keys = calloc(scans, sizeof(*(batch->ddmi_batch->read_keys)));
-		
-		return batch;
+	uint32_t dtmcontrol;
+	if (dtmcs_scan(target->tap, 0, &dtmcontrol) != ERROR_OK || dtmcontrol == 0) {
+		LOG_TARGET_ERROR(target,
+			"Could not read dtmcontrol. Check JTAG connectivity/board power.");
+		return ERROR_FAIL;
 	}
+
+	LOG_TARGET_DEBUG(target, "dtmcontrol=0x%x", dtmcontrol);
+	info->dtm_version = get_field(dtmcontrol, DTM_DTMCS_VERSION);
+	info->abits = get_field(dtmcontrol, DTM_DTMCS_ABITS);
+	info->idle = get_field(dtmcontrol, DTM_DTMCS_IDLE);
+	info->has_dtmcs = true;
+	return ERROR_OK;
+}
+
+static int riscv_dmi_reset_jtag(struct target *target)
+{
+	return dtmcs_scan(target->tap, DTM_DTMCS_DMIRESET, NULL);
+}
+
+static int riscv_dmi_prepare_access_jtag(struct target *target)
+{
+	struct jtag_tap *tap = target->tap;
+
+	if (bscan_tunnel_ir_width != 0) {
+		select_dmi_via_bscan(tap);
+		return ERROR_OK;
+	}
+	if (!tap->enabled)
+		LOG_ERROR("BUG: Target's TAP '%s' is disabled!", jtag_tap_name(tap));
+
+	bool need_ir_scan = false;
+	for (struct jtag_tap *other_tap = jtag_tap_next_enabled(NULL);
+			other_tap; other_tap = jtag_tap_next_enabled(other_tap)) {
+		if (other_tap != tap) {
+			if (!other_tap->bypass) {
+				need_ir_scan = true;
+				break;
+			}
+		} else if (!buf_eq(tap->cur_instr, select_dbus.out_value, tap->ir_length)) {
+			need_ir_scan = true;
+			break;
+		}
+	}
+
+	if (need_ir_scan)
+		jtag_add_ir_scan(tap, &select_dbus, TAP_IDLE);
+
+	return ERROR_OK;
+}
+
+static int riscv_dmi_get_info_direct(struct target *target, struct riscv_dmi_info *info)
+{
+	info->dtm_version = DTM_DTMCS_VERSION_1_0;
+	info->abits = RISCV013_DTMCS_ABITS_MAX;
+	info->idle = 0;
+	info->has_dtmcs = false;
+	return ERROR_OK;
+}
+
+static int riscv_dmi_reset_direct(struct target *target)
+{
+	return riscv_dmi_direct_reset();
+}
+
+static int riscv_dmi_prepare_access_direct(struct target *target)
+{
+	return ERROR_OK;
+}
+
+static struct riscv_batch *riscv_batch_alloc_direct(struct target *target, size_t scans)
+{
+	struct riscv_batch *batch = calloc(1, sizeof(*batch));
+	if (!batch)
+		return NULL;
+
+	batch->target = target;
+	batch->backend = &riscv_dmi_direct_backend;
+	batch->direct_batch = calloc(1, sizeof(*(batch->direct_batch)));
+	if (!batch->direct_batch) {
+		free(batch);
+		return NULL;
+	}
+
+	batch->direct_batch->allocated_ops = scans;
+	batch->direct_batch->ops = calloc(scans, sizeof(*(batch->direct_batch->ops)));
+	batch->direct_batch->read_keys = calloc(scans, sizeof(*(batch->direct_batch->read_keys)));
+	if (!batch->direct_batch->ops || !batch->direct_batch->read_keys) {
+		riscv_batch_free(batch);
+		return NULL;
+	}
+
+	return batch;
+}
+
+static struct riscv_batch *riscv_batch_alloc_jtag(struct target *target, size_t scans)
+{
 	scans += BATCH_RESERVED_SCANS;
 	struct riscv_batch *out = calloc(1, sizeof(*out));
 	if (!out) {
@@ -67,6 +164,7 @@ struct riscv_batch *riscv_batch_alloc(struct target *target, size_t scans)
 	}
 
 	out->target = target;
+	out->backend = &riscv_dmi_jtag_backend;
 	out->allocated_scans = scans;
 	out->last_scan = RISCV_SCAN_TYPE_INVALID;
 	out->was_run = false;
@@ -122,7 +220,16 @@ alloc_error:
 	return NULL;
 }
 
-void riscv_batch_free(struct riscv_batch *batch)
+struct riscv_batch *riscv_batch_alloc(struct target *target, size_t scans)
+{
+	const struct riscv_dmi_backend_ops *backend = riscv_dmi_backend(target);
+	assert(backend);
+	assert(backend->batch_alloc);
+
+	return backend->batch_alloc(target, scans);
+}
+
+static void riscv_batch_free_common(struct riscv_batch *batch)
 {
 	free(batch->data_in);
 	free(batch->data_out);
@@ -130,24 +237,46 @@ void riscv_batch_free(struct riscv_batch *batch)
 	free(batch->delay_classes);
 	free(batch->bscan_ctxt);
 	free(batch->read_keys);
-	free(batch->ddmi_batch->ops);
-    free(batch->ddmi_batch->read_keys);
+	if (batch->direct_batch) {
+		free(batch->direct_batch->ops);
+		free(batch->direct_batch->read_keys);
+		free(batch->direct_batch);
+	}
 	free(batch);
 }
 
-
-int ddmi_batch_run(struct riscv_batch *batch)
+void riscv_batch_free(struct riscv_batch *batch)
 {
+	assert(batch);
+	assert(batch->backend);
+	assert(batch->backend->batch_free);
+
+	batch->backend->batch_free(batch);
+}
+
+
+static int riscv_batch_run_from_direct(struct riscv_batch *batch, size_t start_idx,
+		const struct riscv_scan_delays *delays, bool resets_delays,
+		size_t reset_delays_after)
+{
+	assert(start_idx == 0);
 	keep_alive();
-    for (size_t i = 0; i < batch->ddmi_batch->used_ops; ++i) {
-        if (batch->ddmi_batch->ops[i].opcode == RV_OP_READ) {
-			ddmi_read(NULL, &batch->ddmi_batch->ops[i].params.read.data_from_target, batch->ddmi_batch->ops[i].params.read.addr);
-        }
-		if (batch->ddmi_batch->ops[i].opcode == RV_OP_WRITE) {
-			ddmi_write(NULL, batch->ddmi_batch->ops[i].params.write.addr, batch->ddmi_batch->ops[i].params.write.data_to_target);
-        }
-    }
-	ddmi_batch_exec();
+	for (size_t i = 0; i < batch->direct_batch->used_ops; ++i) {
+		int result = ERROR_OK;
+
+		if (batch->direct_batch->ops[i].opcode == RV_OP_READ) {
+			result = riscv_dmi_direct_read(batch->direct_batch->ops[i].params.read.addr,
+				&batch->direct_batch->ops[i].params.read.data_from_target);
+		}
+		if (batch->direct_batch->ops[i].opcode == RV_OP_WRITE) {
+			result = riscv_dmi_direct_write(batch->direct_batch->ops[i].params.write.addr,
+				batch->direct_batch->ops[i].params.write.data_to_target);
+		}
+		if (result != ERROR_OK)
+			return result;
+	}
+	riscv_dmi_direct_batch_exec();
+	batch->was_run = true;
 	keep_alive();
 	return ERROR_OK;
 }
@@ -323,10 +452,13 @@ static void log_batch(const struct riscv_batch *batch, size_t start_idx,
 	}
 }
 
-int riscv_batch_run_from(struct riscv_batch *batch, size_t start_idx,
+static int riscv_batch_run_from_jtag(struct riscv_batch *batch, size_t start_idx,
 		const struct riscv_scan_delays *delays, bool resets_delays,
 		size_t reset_delays_after)
 {
+	if (!batch->finalized)
+		riscv_batch_add_nop_jtag(batch);
+
 	assert(batch->used_scans);
 	assert(start_idx < batch->used_scans);
 	assert(batch->last_scan == RISCV_SCAN_TYPE_NOP);
@@ -376,21 +508,39 @@ int riscv_batch_run_from(struct riscv_batch *batch, size_t start_idx,
 	return ERROR_OK;
 }
 
-void riscv_batch_add_dmi_write(struct riscv_batch *batch, uint32_t address, uint32_t data,
+int riscv_batch_run_from(struct riscv_batch *batch, size_t start_idx,
+		const struct riscv_scan_delays *delays, bool resets_delays,
+		size_t reset_delays_after)
+{
+	assert(batch);
+	assert(batch->backend);
+	assert(batch->backend->batch_run_from);
+
+	int result = riscv_dmi_prepare_access(batch->target);
+	if (result != ERROR_OK)
+		return result;
+
+	return batch->backend->batch_run_from(batch, start_idx, delays,
+		resets_delays, reset_delays_after);
+}
+
+static void riscv_batch_add_dmi_write_direct(struct riscv_batch *batch, uint32_t address, uint32_t data,
 		bool read_back, enum riscv_scan_delay_class delay_class)
 {
-	if(transport_is_ddmi())
-	{
-		assert(batch->ddmi_batch->used_ops < batch->ddmi_batch->allocated_ops);
+	assert(batch->direct_batch->used_ops < batch->direct_batch->allocated_ops);
 
-		ddmi_op_t *op = &batch->ddmi_batch->ops[batch->ddmi_batch->used_ops++];
-		op->opcode = RV_OP_WRITE;
-		op->params.write.addr = address;
-		op->params.write.data_to_target = data;
-		return;
-	}
-	// TODO: Check that the bit width of "address" is no more than dtmcs.abits,
-	// otherwise return an error (during batch creation or when the batch is executed).
+	struct riscv_dmi_direct_op *op =
+		&batch->direct_batch->ops[batch->direct_batch->used_ops++];
+	op->opcode = RV_OP_WRITE;
+	op->params.write.addr = address;
+	op->params.write.data_to_target = data;
+}
+
+static void riscv_batch_add_dmi_write_jtag(struct riscv_batch *batch, uint32_t address, uint32_t data,
+		bool read_back, enum riscv_scan_delay_class delay_class)
+{
+	/* TODO: Check that the bit width of "address" is no more than dtmcs.abits,
+	 * otherwise return an error during batch creation or when the batch is executed. */
 
 	assert(batch->used_scans < batch->allocated_scans);
 	struct scan_field *field = batch->fields + batch->used_scans;
@@ -416,23 +566,38 @@ void riscv_batch_add_dmi_write(struct riscv_batch *batch, uint32_t address, uint
 	batch->used_scans++;
 }
 
-size_t riscv_batch_add_dmi_read(struct riscv_batch *batch, uint32_t address,
+void riscv_batch_add_dmi_write(struct riscv_batch *batch, uint32_t address, uint32_t data,
+		bool read_back, enum riscv_scan_delay_class delay_class)
+{
+	assert(batch);
+	assert(batch->backend);
+	assert(batch->backend->batch_add_dmi_write);
+
+	batch->backend->batch_add_dmi_write(batch, address, data, read_back,
+		delay_class);
+}
+
+static size_t riscv_batch_add_dmi_read_direct(struct riscv_batch *batch, uint32_t address,
 		enum riscv_scan_delay_class delay_class)
 {
-	if(transport_is_ddmi())
-	{
-		assert(batch->ddmi_batch->used_ops < batch->ddmi_batch->allocated_ops);
+	assert(batch->direct_batch->used_ops < batch->direct_batch->allocated_ops);
 
-		ddmi_op_t *op = &batch->ddmi_batch->ops[batch->ddmi_batch->used_ops++];
-		op->opcode = RV_OP_READ;
-		op->params.read.addr = address;
-		op->params.read.data_from_target = 0; // initially empty
+	struct riscv_dmi_direct_op *op =
+		&batch->direct_batch->ops[batch->direct_batch->used_ops++];
+	op->opcode = RV_OP_READ;
+	op->params.read.addr = address;
+	op->params.read.data_from_target = 0;
 
-		batch->ddmi_batch->read_keys[batch->ddmi_batch->read_keys_used] = batch->ddmi_batch->used_ops - 1;
-		return batch->ddmi_batch->read_keys_used++;
-	}
-	// TODO: Check that the bit width of "address" is no more than dtmcs.abits,
-	// otherwise return an error (during batch creation or when the batch is executed).
+	batch->direct_batch->read_keys[batch->direct_batch->read_keys_used] =
+		batch->direct_batch->used_ops - 1;
+	return batch->direct_batch->read_keys_used++;
+}
+
+static size_t riscv_batch_add_dmi_read_jtag(struct riscv_batch *batch, uint32_t address,
+		enum riscv_scan_delay_class delay_class)
+{
+	/* TODO: Check that the bit width of "address" is no more than dtmcs.abits,
+	 * otherwise return an error during batch creation or when the batch is executed. */
 
 	assert(batch->used_scans < batch->allocated_scans);
 	struct scan_field *field = batch->fields + batch->used_scans;
@@ -456,9 +621,23 @@ size_t riscv_batch_add_dmi_read(struct riscv_batch *batch, uint32_t address,
 	return batch->read_keys_used++;
 }
 
-uint32_t riscv_batch_get_dmi_read_op(const struct riscv_batch *batch, size_t key)
+size_t riscv_batch_add_dmi_read(struct riscv_batch *batch, uint32_t address,
+		enum riscv_scan_delay_class delay_class)
 {
-	if(transport_is_ddmi()) return 0;
+	assert(batch);
+	assert(batch->backend);
+	assert(batch->backend->batch_add_dmi_read);
+
+	return batch->backend->batch_add_dmi_read(batch, address, delay_class);
+}
+
+static uint32_t riscv_batch_get_dmi_read_op_direct(const struct riscv_batch *batch, size_t key)
+{
+	return DTM_DMI_OP_SUCCESS;
+}
+
+static uint32_t riscv_batch_get_dmi_read_op_jtag(const struct riscv_batch *batch, size_t key)
+{
 	assert(key < batch->read_keys_used);
 	size_t index = batch->read_keys[key];
 	assert(index < batch->used_scans);
@@ -467,16 +646,26 @@ uint32_t riscv_batch_get_dmi_read_op(const struct riscv_batch *batch, size_t key
 	return buf_get_u32(base, DTM_DMI_OP_OFFSET, DTM_DMI_OP_LENGTH);
 }
 
-uint32_t riscv_batch_get_dmi_read_data(const struct riscv_batch *batch, size_t key)
+uint32_t riscv_batch_get_dmi_read_op(const struct riscv_batch *batch, size_t key)
 {
-	if(transport_is_ddmi())
-	{
-		assert(key < batch->ddmi_batch->read_keys_used);
-		size_t index = batch->ddmi_batch->read_keys[key];
-		assert(index < batch->ddmi_batch->used_ops);
+	assert(batch);
+	assert(batch->backend);
+	assert(batch->backend->batch_get_dmi_read_op);
 
-		return batch->ddmi_batch->ops[index].params.read.data_from_target;
-	}
+	return batch->backend->batch_get_dmi_read_op(batch, key);
+}
+
+static uint32_t riscv_batch_get_dmi_read_data_direct(const struct riscv_batch *batch, size_t key)
+{
+	assert(key < batch->direct_batch->read_keys_used);
+	size_t index = batch->direct_batch->read_keys[key];
+	assert(index < batch->direct_batch->used_ops);
+
+	return batch->direct_batch->ops[index].params.read.data_from_target;
+}
+
+static uint32_t riscv_batch_get_dmi_read_data_jtag(const struct riscv_batch *batch, size_t key)
+{
 	assert(key < batch->read_keys_used);
 	size_t index = batch->read_keys[key];
 	assert(index < batch->used_scans);
@@ -485,9 +674,20 @@ uint32_t riscv_batch_get_dmi_read_data(const struct riscv_batch *batch, size_t k
 	return buf_get_u32(base, DTM_DMI_DATA_OFFSET, DTM_DMI_DATA_LENGTH);
 }
 
-void riscv_batch_add_nop(struct riscv_batch *batch)
+uint32_t riscv_batch_get_dmi_read_data(const struct riscv_batch *batch, size_t key)
 {
-	if(transport_is_ddmi())	return;
+	assert(batch);
+	assert(batch->backend);
+	assert(batch->backend->batch_get_dmi_read_data);
+
+	return batch->backend->batch_get_dmi_read_data(batch, key);
+}
+
+static void riscv_batch_add_nop_jtag(struct riscv_batch *batch)
+{
+	if (batch->finalized)
+		return;
+
 	assert(batch->used_scans < batch->allocated_scans);
 	struct scan_field *field = batch->fields + batch->used_scans;
 
@@ -507,31 +707,54 @@ void riscv_batch_add_nop(struct riscv_batch *batch)
 	batch->delay_classes[batch->used_scans] = RISCV_DELAY_BASE;
 	batch->last_scan = RISCV_SCAN_TYPE_NOP;
 	batch->used_scans++;
+	batch->finalized = true;
 }
 
-size_t riscv_batch_available_scans(struct riscv_batch *batch)
+static size_t riscv_batch_available_scans_direct(struct riscv_batch *batch)
 {
-	if(transport_is_ddmi())
-	{
+	if (batch->direct_batch->used_ops >= batch->direct_batch->allocated_ops)
+		return 0;
+	return batch->direct_batch->allocated_ops - batch->direct_batch->used_ops;
+}
 
-		if (batch->ddmi_batch->used_ops >= batch->ddmi_batch->allocated_ops)
-        	return 0;
-    	return batch->ddmi_batch->allocated_ops - batch->ddmi_batch->used_ops;
-	}
+static size_t riscv_batch_available_scans_jtag(struct riscv_batch *batch)
+{
 	assert(batch->allocated_scans >= (batch->used_scans + BATCH_RESERVED_SCANS));
 	return batch->allocated_scans - batch->used_scans - BATCH_RESERVED_SCANS;
 }
 
-bool riscv_batch_was_batch_busy(const struct riscv_batch *batch)
+size_t riscv_batch_available_scans(struct riscv_batch *batch)
+{
+	assert(batch);
+	assert(batch->backend);
+	assert(batch->backend->batch_available_scans);
+
+	return batch->backend->batch_available_scans(batch);
+}
+
+static bool riscv_batch_was_batch_busy_direct(const struct riscv_batch *batch)
 {
 	return false;
+}
+
+static bool riscv_batch_was_batch_busy_jtag(const struct riscv_batch *batch)
+{
 	assert(batch->was_run);
 	assert(batch->used_scans);
 	assert(batch->last_scan == RISCV_SCAN_TYPE_NOP);
 	return riscv_batch_was_scan_busy(batch, batch->used_scans - 1);
 }
 
-size_t riscv_batch_finished_scans(const struct riscv_batch *batch)
+bool riscv_batch_was_batch_busy(const struct riscv_batch *batch)
+{
+	assert(batch);
+	assert(batch->backend);
+	assert(batch->backend->batch_was_busy);
+
+	return batch->backend->batch_was_busy(batch);
+}
+
+static size_t riscv_batch_finished_scans_jtag(const struct riscv_batch *batch)
 {
 	if (!riscv_batch_was_batch_busy(batch)) {
 		/* Whole batch succeeded. */
@@ -543,3 +766,51 @@ size_t riscv_batch_finished_scans(const struct riscv_batch *batch)
 		++first_busy;
 	return first_busy;
 }
+
+static size_t riscv_batch_finished_scans_direct(const struct riscv_batch *batch)
+{
+	return batch->direct_batch->used_ops;
+}
+
+size_t riscv_batch_finished_scans(const struct riscv_batch *batch)
+{
+	assert(batch);
+	assert(batch->backend);
+	assert(batch->backend->batch_finished_scans);
+
+	return batch->backend->batch_finished_scans(batch);
+}
+
+const struct riscv_dmi_backend_ops riscv_dmi_jtag_backend = {
+	.name = "jtag",
+	.get_info = riscv_dmi_get_info_jtag,
+	.reset = riscv_dmi_reset_jtag,
+	.prepare_access = riscv_dmi_prepare_access_jtag,
+	.batch_alloc = riscv_batch_alloc_jtag,
+	.batch_free = riscv_batch_free_common,
+	.batch_run_from = riscv_batch_run_from_jtag,
+	.batch_add_dmi_write = riscv_batch_add_dmi_write_jtag,
+	.batch_add_dmi_read = riscv_batch_add_dmi_read_jtag,
+	.batch_get_dmi_read_op = riscv_batch_get_dmi_read_op_jtag,
+	.batch_get_dmi_read_data = riscv_batch_get_dmi_read_data_jtag,
+	.batch_available_scans = riscv_batch_available_scans_jtag,
+	.batch_was_busy = riscv_batch_was_batch_busy_jtag,
+	.batch_finished_scans = riscv_batch_finished_scans_jtag,
+};
+
+const struct riscv_dmi_backend_ops riscv_dmi_direct_backend = {
+	.name = "direct",
+	.get_info = riscv_dmi_get_info_direct,
+	.reset = riscv_dmi_reset_direct,
+	.prepare_access = riscv_dmi_prepare_access_direct,
+	.batch_alloc = riscv_batch_alloc_direct,
+	.batch_free = riscv_batch_free_common,
+	.batch_run_from = riscv_batch_run_from_direct,
+	.batch_add_dmi_write = riscv_batch_add_dmi_write_direct,
+	.batch_add_dmi_read = riscv_batch_add_dmi_read_direct,
+	.batch_get_dmi_read_op = riscv_batch_get_dmi_read_op_direct,
+	.batch_get_dmi_read_data = riscv_batch_get_dmi_read_data_direct,
+	.batch_available_scans = riscv_batch_available_scans_direct,
+	.batch_was_busy = riscv_batch_was_batch_busy_direct,
+	.batch_finished_scans = riscv_batch_finished_scans_direct,
+};

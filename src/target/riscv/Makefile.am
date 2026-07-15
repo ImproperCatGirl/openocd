@@ -5,6 +5,7 @@ noinst_LTLIBRARIES += %D%/libriscv.la
        %D%/batch.h \
        %D%/debug_defines.h \
        %D%/debug_reg_printer.h \
+       %D%/dmi.h \
        %D%/encoding.h \
        %D%/field_helpers.h \
        %D%/gdb_regs.h \
@@ -27,6 +28,7 @@ noinst_LTLIBRARIES += %D%/libriscv.la
        %D%/riscv_reg.c \
        %D%/riscv_semihosting.c \
        %D%/debug_defines.c \
-       %D%/debug_reg_printer.c
+       %D%/debug_reg_printer.c \
+       %D%/dmi.c
 
 STARTUP_TCL_SRCS += %D%/startup.tcl

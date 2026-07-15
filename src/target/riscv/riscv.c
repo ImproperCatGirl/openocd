@@ -21,6 +21,7 @@
 #include "target/breakpoints.h"
 #include "helper/base64.h"
 #include "helper/time_support.h"
+#include "dmi.h"
 #include "riscv.h"
 #include "riscv_reg.h"
 #include "program.h"
@@ -2496,17 +2497,15 @@ static int riscv_examine(struct target *target)
 		LOG_TARGET_DEBUG(target, "Target was already examined.");
 		return ERROR_OK;
 	}
-	/* Don't need to select dbus, since the first thing we do is read dtmcontrol. */
-
 	RISCV_INFO(info);
-	/*uint32_t dtmcontrol;
-	if (dtmcs_scan(target->tap, 0, &dtmcontrol) != ERROR_OK || dtmcontrol == 0) {
-		LOG_TARGET_ERROR(target, "Could not read dtmcontrol. Check JTAG connectivity/board power.");
+	if (riscv_dmi_select(target) != ERROR_OK)
 		return ERROR_FAIL;
-	}
-	LOG_TARGET_DEBUG(target, "dtmcontrol=0x%x", dtmcontrol);*/
-	//info->dtm_version = get_field(dtmcontrol, DTMCONTROL_VERSION);
-	info->dtm_version = DTM_DTMCS_VERSION_1_0;
+
+	struct riscv_dmi_info dmi_info;
+	if (riscv_dmi_get_info(target, &dmi_info) != ERROR_OK)
+		return ERROR_FAIL;
+
+	info->dtm_version = dmi_info.dtm_version;
 	LOG_TARGET_DEBUG(target, "version=0x%x", info->dtm_version);
 
 	int examine_status = ERROR_FAIL;

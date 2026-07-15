@@ -16,12 +16,12 @@ struct ddmi_driver {
     /**
      * Read DMI register (your PIO read)
      */
-    int (*dmi_read)(uint8_t address, uint32_t *value);
+    int (*dmi_read)(uint32_t address, uint32_t *value);
     
     /**
      * Write DMI register (your PIO write)
      */
-    int (*dmi_write)(uint8_t address, uint32_t value);
+    int (*dmi_write)(uint32_t address, uint32_t value);
     
     /**
      * System reset

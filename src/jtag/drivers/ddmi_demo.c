@@ -1,6 +1,7 @@
 #include "helper/log.h"
 #include "jtag/interface.h"
 #include "jtag/ddmi.h"
+#include "target/riscv/dmi.h"
 #include "transport/transport.h"
 #include <libusb.h>
 #include <stdlib.h>
@@ -102,7 +103,7 @@ int batch_add_op(struct rv_usb_batch *batch, char type, uint32_t addr, uint32_t 
 }
 
 // ------------------------- Read / Write Wrappers -------------------------
-static int ddmi_usb_dmi_read(uint8_t addr, uint32_t *value)
+static int ddmi_usb_dmi_read(uint32_t addr, uint32_t *value)
 {
     batch_add_read(&r_w_buffer, addr, value);
     //usb_dmi_op(ddmi_usb_priv.handle, 'r', addr, 0x0, value);
@@ -110,7 +111,7 @@ static int ddmi_usb_dmi_read(uint8_t addr, uint32_t *value)
     
 }
 
-static int ddmi_usb_dmi_write(uint8_t addr, uint32_t value)
+static int ddmi_usb_dmi_write(uint32_t addr, uint32_t value)
 {
     batch_add_op(&r_w_buffer, 'w', addr, value);
     // YOUR REAL PIO IMPLEMENTATION HERE
@@ -203,6 +204,11 @@ static int ddmi_reset(int srst, int trst)
     return ERROR_OK;
 }
 
+static int ddmi_direct_reset(void)
+{
+    return ddmi_reset(0, 0);
+}
+
 static int ddmi_usb_quit(void)
 {
     libusb_release_interface(ddmi_usb_priv.handle, 0);
@@ -268,6 +274,13 @@ static int ddmi_usb_init(void)
         .batch_exec = ddmi_exec_queue,
     };
     ddmi_driver = &usb_driver;
+    static const struct riscv_dmi_direct_ops direct_ops = {
+        .read = ddmi_usb_dmi_read,
+        .write = ddmi_usb_dmi_write,
+        .reset = ddmi_direct_reset,
+        .batch_exec = ddmi_exec_queue,
+    };
+    riscv_dmi_direct_register_ops(&direct_ops);
     ddmi_init_reset(ddmi_usb_priv.handle);
     return ERROR_OK;
 }
