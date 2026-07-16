@@ -15,6 +15,7 @@
 #include "target/target.h"
 #include "target/algorithm.h"
 #include "target/target_type.h"
+#include "target/arm_adi_v5.h"
 #include <target/smp.h>
 #include "jtag/jtag.h"
 #include "target/register.h"
@@ -22,6 +23,7 @@
 #include "helper/base64.h"
 #include "helper/time_support.h"
 #include "dmi.h"
+#include "dtm.h"
 #include "riscv.h"
 #include "riscv_reg.h"
 #include "program.h"
@@ -483,7 +485,7 @@ static struct target_type *get_target_type(struct target *target)
 
 static struct riscv_private_config *alloc_default_riscv_private_config(void)
 {
-	struct riscv_private_config * const config = malloc(sizeof(*config));
+	struct riscv_private_config * const config = calloc(1, sizeof(*config));
 	if (!config) {
 		LOG_ERROR("Out of memory!");
 		return NULL;
@@ -511,6 +513,8 @@ static int riscv_create_target(struct target *target)
 		return ERROR_FAIL;
 	}
 	riscv_info_init(target, target->arch_info);
+	RISCV_INFO(info);
+	info->dtm = config->dtm;
 	return ERROR_OK;
 }
 
@@ -617,13 +621,28 @@ static int jim_report_ebreak_config(const struct riscv_private_config *config,
 	return JIM_OK;
 }
 
+static struct adiv5_private_config *riscv_get_adiv5_config(
+		struct riscv_private_config *config)
+{
+	if (!config->adiv5_config) {
+		config->adiv5_config = calloc(1, sizeof(*config->adiv5_config));
+		if (!config->adiv5_config)
+			return NULL;
+		config->adiv5_config->ap_num = DP_APSEL_INVALID;
+	}
+
+	return config->adiv5_config;
+}
+
 enum riscv_cfg_opts {
 	RISCV_CFG_EBREAK,
+	RISCV_CFG_DTM,
 	RISCV_CFG_INVALID = -1
 };
 
 static struct jim_nvp nvp_config_opts[] = {
 	{ .name = "-ebreak", .value = RISCV_CFG_EBREAK },
+	{ .name = "-dtm", .value = RISCV_CFG_DTM },
 	{ .name = NULL, .value = RISCV_CFG_INVALID }
 };
 
@@ -643,8 +662,23 @@ static int riscv_jim_configure(struct target *target,
 	struct jim_nvp *n;
 	int e = jim_nvp_name2value_obj(goi->interp, nvp_config_opts,
 				goi->argv[0], &n);
-	if (e != JIM_OK)
-		return JIM_CONTINUE;
+	if (e != JIM_OK) {
+		struct adiv5_private_config *adiv5_config =
+			riscv_get_adiv5_config(config);
+		if (!adiv5_config)
+			return JIM_ERR;
+
+		int adiv5_result = adiv5_jim_configure_ext(target, goi,
+				adiv5_config, ADI_CONFIGURE_DAP_OPTIONAL);
+		if (adiv5_result == JIM_OK && goi->is_configure
+				&& adiv5_config->dap
+				&& adiv5_config->ap_num != DP_APSEL_INVALID) {
+			if (riscv_dtm_assign_ap_target(target, adiv5_config->dap,
+					adiv5_config->ap_num) != ERROR_OK)
+				return JIM_ERR;
+		}
+		return adiv5_result;
+	}
 
 	e = jim_getopt_obj(goi, NULL);
 	if (e != JIM_OK)
@@ -660,6 +694,27 @@ static int riscv_jim_configure(struct target *target,
 		return goi->is_configure
 			? jim_configure_ebreak(config, goi)
 			: jim_report_ebreak_config(config, goi->interp);
+	case RISCV_CFG_DTM:
+		if (goi->is_configure) {
+			Jim_Obj *dtm_obj;
+			e = jim_getopt_obj(goi, &dtm_obj);
+			if (e != JIM_OK)
+				return e;
+			struct riscv_dtm *dtm = riscv_dtm_by_jim_obj(goi->interp, dtm_obj);
+			if (!dtm) {
+				Jim_SetResultString(goi->interp, "RISC-V DTM not found", -1);
+				return JIM_ERR;
+			}
+			if (riscv_dtm_assign_target(target, dtm) != ERROR_OK)
+				return JIM_ERR;
+			return JIM_OK;
+		}
+		if (!config->dtm) {
+			Jim_SetResultString(goi->interp, "", -1);
+			return JIM_OK;
+		}
+		Jim_SetResultString(goi->interp, riscv_dtm_name(config->dtm), -1);
+		return JIM_OK;
 	default:
 		assert(false && "'jim_getopt_nvp' should have returned an error.");
 	}
@@ -674,28 +729,36 @@ static int riscv_init_target(struct command_context *cmd_ctx,
 	info->cmd_ctx = cmd_ctx;
 	info->reset_delays_wait = -1;
 
-	select_dtmcontrol.num_bits = target->tap->ir_length;
-	select_dbus.num_bits = target->tap->ir_length;
-	select_idcode.num_bits = target->tap->ir_length;
+	riscv_semihosting_init(target);
+
+	target->debug_reason = DBG_REASON_DBGRQ;
+
+	return ERROR_OK;
+}
+
+int riscv_dmi_jtag_init_tap(struct jtag_tap *tap)
+{
+	if (!tap)
+		return ERROR_FAIL;
+
+	select_dtmcontrol.num_bits = tap->ir_length;
+	select_dbus.num_bits = tap->ir_length;
+	select_idcode.num_bits = tap->ir_length;
 
 	if (bscan_tunnel_ir_width != 0) {
 		uint32_t ir_user4_raw = bscan_tunnel_ir_id;
-		/* Provide a default value which target some Xilinx FPGA USER4 IR */
+		/* Provide a default value which targets some Xilinx FPGA USER4 IR. */
 		if (ir_user4_raw == 0) {
-			assert(target->tap->ir_length >= 6);
-			ir_user4_raw = 0x23 << (target->tap->ir_length - 6);
+			assert(tap->ir_length >= 6);
+			ir_user4_raw = 0x23 << (tap->ir_length - 6);
 		}
 		h_u32_to_le(ir_user4, ir_user4_raw);
-		select_user4.num_bits = target->tap->ir_length;
+		select_user4.num_bits = tap->ir_length;
 		if (bscan_tunnel_type == BSCAN_TUNNEL_DATA_REGISTER)
 			bscan_tunnel_data_register_select_dmi[1].num_bits = bscan_tunnel_ir_width;
 		else /* BSCAN_TUNNEL_NESTED_TAP */
 			bscan_tunnel_nested_tap_select_dmi[2].num_bits = bscan_tunnel_ir_width;
 	}
-
-	riscv_semihosting_init(target);
-
-	target->debug_reason = DBG_REASON_DBGRQ;
 
 	return ERROR_OK;
 }
@@ -723,6 +786,9 @@ static void riscv_deinit_target(struct target *target)
 {
 	LOG_TARGET_DEBUG(target, "riscv_deinit_target()");
 
+	struct riscv_private_config *config = target->private_config;
+	if (config)
+		free(config->adiv5_config);
 	free(target->private_config);
 
 	struct riscv_info *info = target->arch_info;
@@ -4812,6 +4878,21 @@ COMMAND_HANDLER(riscv_reset_delays)
 	struct target *target = get_current_target(CMD_CTX);
 	RISCV_INFO(r);
 	r->reset_delays_wait = wait;
+	riscv_dtm_reset_delays(r->dtm, wait);
+	return ERROR_OK;
+}
+
+int riscv_dmi_jtag_set_ir(const char *ir_name, uint32_t value)
+{
+	if (!strcmp(ir_name, "idcode"))
+		buf_set_u32(ir_idcode, 0, 32, value);
+	else if (!strcmp(ir_name, "dtmcs"))
+		buf_set_u32(ir_dtmcontrol, 0, 32, value);
+	else if (!strcmp(ir_name, "dmi"))
+		buf_set_u32(ir_dbus, 0, 32, value);
+	else
+		return ERROR_FAIL;
+
 	return ERROR_OK;
 }
 
@@ -4823,16 +4904,7 @@ COMMAND_HANDLER(riscv_set_ir)
 	uint32_t value;
 	COMMAND_PARSE_NUMBER(u32, CMD_ARGV[1], value);
 
-	if (!strcmp(CMD_ARGV[0], "idcode"))
-		buf_set_u32(ir_idcode, 0, 32, value);
-	else if (!strcmp(CMD_ARGV[0], "dtmcs"))
-		buf_set_u32(ir_dtmcontrol, 0, 32, value);
-	else if (!strcmp(CMD_ARGV[0], "dmi"))
-		buf_set_u32(ir_dbus, 0, 32, value);
-	else
-		return ERROR_FAIL;
-
-	return ERROR_OK;
+	return riscv_dtm_set_ir(CMD_ARGV[0], value);
 }
 
 COMMAND_HANDLER(riscv_resume_order)
@@ -4852,25 +4924,8 @@ COMMAND_HANDLER(riscv_resume_order)
 	return ERROR_OK;
 }
 
-COMMAND_HANDLER(riscv_use_bscan_tunnel)
+int riscv_dmi_jtag_use_bscan_tunnel(uint8_t irwidth, int tunnel_type)
 {
-	uint8_t irwidth = 0;
-	int tunnel_type = BSCAN_TUNNEL_NESTED_TAP;
-
-	if (CMD_ARGC < 1 || CMD_ARGC > 2)
-		return ERROR_COMMAND_SYNTAX_ERROR;
-
-	if (CMD_ARGC >= 1) {
-		COMMAND_PARSE_NUMBER(u8, CMD_ARGV[0], irwidth);
-		assert(BSCAN_TUNNEL_IR_WIDTH_NBITS < 8);
-		if (irwidth >= (uint8_t)1 << BSCAN_TUNNEL_IR_WIDTH_NBITS) {
-			command_print(CMD, "'value' does not fit into %d bits.",
-					BSCAN_TUNNEL_IR_WIDTH_NBITS);
-			return ERROR_COMMAND_ARGUMENT_OVERFLOW;
-		}
-	}
-	if (CMD_ARGC == 2)
-		COMMAND_PARSE_NUMBER(int, CMD_ARGV[1], tunnel_type);
 	if (tunnel_type == BSCAN_TUNNEL_NESTED_TAP)
 		LOG_INFO("Nested Tap based Bscan Tunnel Selected");
 	else if (tunnel_type == BSCAN_TUNNEL_DATA_REGISTER)
@@ -4880,6 +4935,34 @@ COMMAND_HANDLER(riscv_use_bscan_tunnel)
 
 	bscan_tunnel_type = tunnel_type;
 	bscan_tunnel_ir_width = irwidth;
+	return ERROR_OK;
+}
+
+COMMAND_HANDLER(riscv_use_bscan_tunnel)
+{
+	uint8_t irwidth = 0;
+	int tunnel_type = BSCAN_TUNNEL_NESTED_TAP;
+
+	if (CMD_ARGC < 1 || CMD_ARGC > 2)
+		return ERROR_COMMAND_SYNTAX_ERROR;
+
+	COMMAND_PARSE_NUMBER(u8, CMD_ARGV[0], irwidth);
+	assert(BSCAN_TUNNEL_IR_WIDTH_NBITS < 8);
+	if (irwidth >= (uint8_t)1 << BSCAN_TUNNEL_IR_WIDTH_NBITS) {
+		command_print(CMD, "'value' does not fit into %d bits.",
+				BSCAN_TUNNEL_IR_WIDTH_NBITS);
+		return ERROR_COMMAND_ARGUMENT_OVERFLOW;
+	}
+	if (CMD_ARGC == 2)
+		COMMAND_PARSE_NUMBER(int, CMD_ARGV[1], tunnel_type);
+
+	return riscv_dtm_use_bscan_tunnel(irwidth, tunnel_type);
+}
+
+int riscv_dmi_jtag_set_bscan_tunnel_ir(int ir_id)
+{
+	LOG_INFO("Bscan tunnel IR 0x%x selected", ir_id);
+	bscan_tunnel_ir_id = ir_id;
 	return ERROR_OK;
 }
 
@@ -4893,10 +4976,7 @@ COMMAND_HANDLER(riscv_set_bscan_tunnel_ir)
 	if (CMD_ARGC == 1)
 		COMMAND_PARSE_NUMBER(int, CMD_ARGV[0], ir_id);
 
-	LOG_INFO("Bscan tunnel IR 0x%x selected", ir_id);
-
-	bscan_tunnel_ir_id = ir_id;
-	return ERROR_OK;
+	return riscv_dtm_set_bscan_tunnel_ir(ir_id);
 }
 
 COMMAND_HANDLER(riscv_set_maskisr)

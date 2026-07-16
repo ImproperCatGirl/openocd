@@ -5,9 +5,9 @@
 #endif
 
 #include "dmi.h"
+#include "dtm.h"
 #include "riscv.h"
 
-#include "transport/transport.h"
 #include "helper/log.h"
 
 #include <assert.h>
@@ -19,26 +19,20 @@ const struct riscv_dmi_backend_ops *riscv_dmi_backend(struct target *target)
 {
 	RISCV_INFO(r);
 
-	return r->dmi_backend;
+	return r->dtm ? r->dtm->backend : NULL;
 }
 
 int riscv_dmi_select(struct target *target)
 {
 	RISCV_INFO(r);
 
-	if (transport_is_ddmi()) {
-		r->dmi_backend = &riscv_dmi_direct_backend;
-		return ERROR_OK;
-	}
+	if (!r->dtm && riscv_dtm_assign_implicit(target) != ERROR_OK)
+		return ERROR_FAIL;
 
-	if (transport_is_jtag()) {
-		r->dmi_backend = &riscv_dmi_jtag_backend;
-		return ERROR_OK;
-	}
+	if (!r->dtm)
+		return ERROR_FAIL;
 
-	LOG_TARGET_ERROR(target, "Unsupported RISC-V DMI transport '%s'.",
-			get_current_transport_name());
-	return ERROR_FAIL;
+	return riscv_dtm_init(r->dtm);
 }
 
 int riscv_dmi_get_info(struct target *target, struct riscv_dmi_info *info)
@@ -52,7 +46,14 @@ int riscv_dmi_get_info(struct target *target, struct riscv_dmi_info *info)
 		return ERROR_FAIL;
 	}
 
-	return backend->get_info(target, info);
+	int result = backend->get_info(target, info);
+	if (result == ERROR_OK) {
+		RISCV_INFO(r);
+		riscv_dtm_update_info(r->dtm, info->dtm_version, info->abits,
+				info->idle, info->has_dtmcs);
+	}
+
+	return result;
 }
 
 int riscv_dmi_reset(struct target *target)

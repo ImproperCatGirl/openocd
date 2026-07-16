@@ -10,6 +10,8 @@
 #include "batch.h"
 
 struct target;
+struct riscv_dtm;
+struct jtag_tap;
 
 struct riscv_dmi_info {
 	unsigned int dtm_version;
@@ -49,6 +51,7 @@ struct riscv_dmi_backend_ops {
 
 extern const struct riscv_dmi_backend_ops riscv_dmi_jtag_backend;
 extern const struct riscv_dmi_backend_ops riscv_dmi_direct_backend;
+extern const struct riscv_dmi_backend_ops riscv_dmi_ap_backend;
 
 int riscv_dmi_select(struct target *target);
 int riscv_dmi_get_info(struct target *target, struct riscv_dmi_info *info);
@@ -61,5 +64,10 @@ int riscv_dmi_direct_read(uint32_t address, uint32_t *value);
 int riscv_dmi_direct_write(uint32_t address, uint32_t value);
 int riscv_dmi_direct_reset(void);
 void riscv_dmi_direct_batch_exec(void);
+
+int riscv_dmi_jtag_set_ir(const char *ir_name, uint32_t value);
+int riscv_dmi_jtag_use_bscan_tunnel(uint8_t ir_width, int tunnel_type);
+int riscv_dmi_jtag_set_bscan_tunnel_ir(int ir_id);
+int riscv_dmi_jtag_init_tap(struct jtag_tap *tap);
 
 #endif /* OPENOCD_TARGET_RISCV_DMI_H */
