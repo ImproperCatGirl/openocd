@@ -709,7 +709,7 @@ static int jtag_enable_callback(enum jtag_event event, void *priv)
 {
 	struct target *target = priv;
 
-	if (event != JTAG_TAP_EVENT_ENABLE || !target->tap->enabled)
+	if (event != JTAG_TAP_EVENT_ENABLE || !target->tap || !target->tap->enabled)
 		return ERROR_OK;
 
 	jtag_unregister_event_callback(jtag_enable_callback, target);
@@ -729,7 +729,7 @@ int target_examine(void)
 
 	for (target = all_targets; target; target = target->next) {
 		/* defer examination, but don't skip it */
-		if (!target->tap->enabled) {
+		if (target->tap && !target->tap->enabled) {
 			jtag_register_event_callback(jtag_enable_callback,
 					target);
 			continue;
@@ -2788,7 +2788,7 @@ static int find_target(struct command_invocation *cmd, const char *name)
 		command_print(cmd, "Target: %s is unknown, try one of:\n", name);
 		return ERROR_FAIL;
 	}
-	if (!target->tap->enabled) {
+	if (target->tap && !target->tap->enabled) {
 		command_print(cmd, "Target: TAP %s is disabled, "
 			 "can't be the current target\n",
 			 target->tap->dotted_name);
@@ -2821,7 +2821,9 @@ COMMAND_HANDLER(handle_targets_command)
 		const char *state;
 		char marker = ' ';
 
-		if (target->tap->enabled)
+		if (!target->tap)
+			state = target_state_name(target);
+		else if (target->tap->enabled)
 			state = target_state_name(target);
 		else
 			state = "tap-disabled";
@@ -2837,7 +2839,7 @@ COMMAND_HANDLER(handle_targets_command)
 				target_name(target),
 				target_type_name(target),
 				nvp_value2name(nvp_target_endian, target->endianness)->name,
-				target->tap->dotted_name,
+				target->tap ? target->tap->dotted_name : "<none>",
 				state);
 	}
 
@@ -2908,7 +2910,7 @@ static int sense_handler(void)
 
 static int handle_one_target(struct target *target)
 {
-	if (!target_active_polled(target) || !target->tap->enabled)
+	if (!target_active_polled(target) || (target->tap && !target->tap->enabled))
 		return ERROR_OK;
 
 	int res = target_poll(target);
@@ -3159,10 +3161,14 @@ COMMAND_HANDLER(handle_poll_command)
 	if (CMD_ARGC == 0) {
 		command_print(CMD, "background polling: %s",
 				jtag_poll_get_enabled() ? "on" : "off");
-		command_print(CMD, "TAP: %s (%s)",
-				target->tap->dotted_name,
-				target->tap->enabled ? "enabled" : "disabled");
-		if (!target->tap->enabled)
+		if (target->tap) {
+			command_print(CMD, "TAP: %s (%s)",
+					target->tap->dotted_name,
+					target->tap->enabled ? "enabled" : "disabled");
+		} else {
+			command_print(CMD, "TAP: <none>");
+		}
+		if (target->tap && !target->tap->enabled)
 			return ERROR_OK;
 		retval = target_poll(target);
 		if (retval != ERROR_OK)
@@ -5331,7 +5337,7 @@ COMMAND_HANDLER(handle_target_examine)
 	}
 
 	struct target *target = get_current_target(CMD_CTX);
-	if (!target->tap->enabled) {
+	if (target->tap && !target->tap->enabled) {
 		command_print(CMD, "[TAP is disabled]");
 		return ERROR_FAIL;
 	}
@@ -5393,7 +5399,7 @@ COMMAND_HANDLER(handle_target_poll)
 		return ERROR_COMMAND_SYNTAX_ERROR;
 
 	struct target *target = get_current_target(CMD_CTX);
-	if (!target->tap->enabled) {
+	if (target->tap && !target->tap->enabled) {
 		command_print(CMD, "[TAP is disabled]");
 		return ERROR_FAIL;
 	}
@@ -5420,7 +5426,7 @@ COMMAND_HANDLER(handle_target_reset)
 	COMMAND_PARSE_NUMBER(int, CMD_ARGV[1], a);
 
 	struct target *target = get_current_target(CMD_CTX);
-	if (!target->tap->enabled) {
+	if (target->tap && !target->tap->enabled) {
 		command_print(CMD, "[TAP is disabled]");
 		return ERROR_FAIL;
 	}
@@ -5454,7 +5460,7 @@ COMMAND_HANDLER(handle_target_halt)
 		return ERROR_COMMAND_SYNTAX_ERROR;
 
 	struct target *target = get_current_target(CMD_CTX);
-	if (!target->tap->enabled) {
+	if (target->tap && !target->tap->enabled) {
 		command_print(CMD, "[TAP is disabled]");
 		return ERROR_FAIL;
 	}
@@ -5477,7 +5483,7 @@ COMMAND_HANDLER(handle_target_wait_state)
 	COMMAND_PARSE_NUMBER(uint, CMD_ARGV[1], a);
 
 	struct target *target = get_current_target(CMD_CTX);
-	if (!target->tap->enabled) {
+	if (target->tap && !target->tap->enabled) {
 		command_print(CMD, "[TAP is disabled]");
 		return ERROR_FAIL;
 	}
@@ -5920,14 +5926,20 @@ COMMAND_HANDLER(handle_target_create)
 				command_print(CMD, "-dap ?name? required when creating target");
 				retval = ERROR_COMMAND_ARGUMENT_INVALID;
 			}
+		} else if (target->has_dtm) {
+			if (!target->dtm_configured) {
+				command_print(CMD, "-dtm ?name? required when creating target");
+				retval = ERROR_COMMAND_ARGUMENT_INVALID;
+			}
 		} else {
 			if (!target->tap_configured) {
 				command_print(CMD, "-chain-position ?name? required when creating target");
 				retval = ERROR_COMMAND_ARGUMENT_INVALID;
 			}
 		}
-		/* tap must be set after target was configured */
-		if (!target->tap)
+		/* tap must be set after target was configured, unless the target
+		 * uses a non-JTAG DTM. */
+		if (!target->tap && !target->has_dtm)
 			retval = ERROR_COMMAND_ARGUMENT_INVALID;
 	}
 

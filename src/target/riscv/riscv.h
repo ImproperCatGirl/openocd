@@ -5,6 +5,8 @@
 
 struct riscv_program;
 struct riscv_dmi_backend_ops;
+struct riscv_dtm;
+struct adiv5_private_config;
 
 #include <stdint.h>
 #include "opcodes.h"
@@ -170,7 +172,7 @@ struct riscv_info {
 	unsigned int common_magic;
 
 	unsigned int dtm_version;
-	const struct riscv_dmi_backend_ops *dmi_backend;
+	struct riscv_dtm *dtm;
 
 	struct command_context *cmd_ctx;
 	void *version_specific;
@@ -380,6 +382,8 @@ enum riscv_priv_mode {
 
 struct riscv_private_config {
 	bool dcsr_ebreak_fields[N_RISCV_MODE];
+	struct riscv_dtm *dtm;
+	struct adiv5_private_config *adiv5_config;
 };
 
 static inline struct riscv_private_config

@@ -27,6 +27,7 @@
 #include <target/arm_cti.h>
 #include <target/arm_adi_v5.h>
 #include <target/arm_tpiu_swo.h>
+#include <target/riscv/dtm.h>
 #include <rtt/rtt.h>
 
 #include <server/server.h>
@@ -147,6 +148,10 @@ COMMAND_HANDLER(handle_init_command)
 	if (retval != ERROR_OK)
 		return ERROR_FAIL;
 
+	retval = command_run_line(CMD_CTX, "dtm init");
+	if (retval != ERROR_OK)
+		return ERROR_FAIL;
+
 	LOG_DEBUG("Examining targets...");
 	if (target_examine() != ERROR_OK)
 		LOG_DEBUG("target examination failed");
@@ -247,6 +252,7 @@ static int (* const command_registrants[])(struct command_context *cmd_ctx_value
 	pld_register_commands,
 	cti_register_commands,
 	dap_register_commands,
+	riscv_dtm_register_commands,
 	arm_tpiu_swo_register_commands,
 };
 
@@ -362,6 +368,7 @@ int openocd_main(int argc, char *argv[])
 	/* free all DAP and CTI objects */
 	arm_cti_cleanup_all();
 	dap_cleanup_all();
+	riscv_dtm_cleanup_all();
 
 	adapter_quit();
 

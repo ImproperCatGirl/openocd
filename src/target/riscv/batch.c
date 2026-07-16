@@ -8,8 +8,11 @@
 #include "debug_defines.h"
 #include "debug_reg_printer.h"
 #include "dmi.h"
+#include "dtm.h"
 #include "riscv.h"
 #include "field_helpers.h"
+
+#include <target/arm_adi_v5.h>
 
 #define DTM_DMI_MAX_ADDRESS_LENGTH	((1<<DTM_DTMCS_ABITS_LENGTH)-1)
 #define DMI_SCAN_MAX_BIT_LENGTH (DTM_DMI_MAX_ADDRESS_LENGTH + DTM_DMI_DATA_LENGTH + DTM_DMI_OP_LENGTH)
@@ -129,14 +132,49 @@ static int riscv_dmi_prepare_access_direct(struct target *target)
 	return ERROR_OK;
 }
 
-static struct riscv_batch *riscv_batch_alloc_direct(struct target *target, size_t scans)
+static int riscv_dmi_get_info_ap(struct target *target, struct riscv_dmi_info *info)
+{
+	info->dtm_version = DTM_DTMCS_VERSION_1_0;
+	info->abits = RISCV013_DTMCS_ABITS_MAX;
+	info->idle = 0;
+	info->has_dtmcs = false;
+	return ERROR_OK;
+}
+
+static int riscv_dmi_reset_ap(struct target *target)
+{
+	return ERROR_OK;
+}
+
+static struct riscv_dmi_ap_config *riscv_dmi_ap_config(struct target *target)
+{
+	RISCV_INFO(r);
+
+	if (!r->dtm)
+		return NULL;
+	return r->dtm->backend_priv;
+}
+
+static int riscv_dmi_prepare_access_ap(struct target *target)
+{
+	struct riscv_dmi_ap_config *config = riscv_dmi_ap_config(target);
+	if (!config || !config->ap) {
+		LOG_TARGET_ERROR(target, "RISC-V AP-backed DTM is not initialized.");
+		return ERROR_FAIL;
+	}
+
+	return ERROR_OK;
+}
+
+static struct riscv_batch *riscv_batch_alloc_dmi_ops(struct target *target,
+		size_t scans, const struct riscv_dmi_backend_ops *backend)
 {
 	struct riscv_batch *batch = calloc(1, sizeof(*batch));
 	if (!batch)
 		return NULL;
 
 	batch->target = target;
-	batch->backend = &riscv_dmi_direct_backend;
+	batch->backend = backend;
 	batch->direct_batch = calloc(1, sizeof(*(batch->direct_batch)));
 	if (!batch->direct_batch) {
 		free(batch);
@@ -152,6 +190,16 @@ static struct riscv_batch *riscv_batch_alloc_direct(struct target *target, size_
 	}
 
 	return batch;
+}
+
+static struct riscv_batch *riscv_batch_alloc_direct(struct target *target, size_t scans)
+{
+	return riscv_batch_alloc_dmi_ops(target, scans, &riscv_dmi_direct_backend);
+}
+
+static struct riscv_batch *riscv_batch_alloc_ap(struct target *target, size_t scans)
+{
+	return riscv_batch_alloc_dmi_ops(target, scans, &riscv_dmi_ap_backend);
 }
 
 static struct riscv_batch *riscv_batch_alloc_jtag(struct target *target, size_t scans)
@@ -276,6 +324,42 @@ static int riscv_batch_run_from_direct(struct riscv_batch *batch, size_t start_i
 			return result;
 	}
 	riscv_dmi_direct_batch_exec();
+	batch->was_run = true;
+	keep_alive();
+	return ERROR_OK;
+}
+
+static int riscv_batch_run_from_ap(struct riscv_batch *batch, size_t start_idx,
+		const struct riscv_scan_delays *delays, bool resets_delays,
+		size_t reset_delays_after)
+{
+	assert(start_idx == 0);
+
+	struct riscv_dmi_ap_config *config = riscv_dmi_ap_config(batch->target);
+	if (!config || !config->ap)
+		return ERROR_FAIL;
+
+	keep_alive();
+	for (size_t i = 0; i < batch->direct_batch->used_ops; ++i) {
+		int result = ERROR_OK;
+		struct riscv_dmi_direct_op *op = &batch->direct_batch->ops[i];
+
+		if (op->opcode == RV_OP_READ) {
+			result = mem_ap_read_u32(config->ap, op->params.read.addr * 4,
+				&op->params.read.data_from_target);
+		}
+		if (op->opcode == RV_OP_WRITE) {
+			result = mem_ap_write_u32(config->ap, op->params.write.addr * 4,
+				op->params.write.data_to_target);
+		}
+		if (result != ERROR_OK)
+			return result;
+	}
+
+	int result = dap_run(config->ap->dap);
+	if (result != ERROR_OK)
+		return result;
+
 	batch->was_run = true;
 	keep_alive();
 	return ERROR_OK;
@@ -806,6 +890,23 @@ const struct riscv_dmi_backend_ops riscv_dmi_direct_backend = {
 	.batch_alloc = riscv_batch_alloc_direct,
 	.batch_free = riscv_batch_free_common,
 	.batch_run_from = riscv_batch_run_from_direct,
+	.batch_add_dmi_write = riscv_batch_add_dmi_write_direct,
+	.batch_add_dmi_read = riscv_batch_add_dmi_read_direct,
+	.batch_get_dmi_read_op = riscv_batch_get_dmi_read_op_direct,
+	.batch_get_dmi_read_data = riscv_batch_get_dmi_read_data_direct,
+	.batch_available_scans = riscv_batch_available_scans_direct,
+	.batch_was_busy = riscv_batch_was_batch_busy_direct,
+	.batch_finished_scans = riscv_batch_finished_scans_direct,
+};
+
+const struct riscv_dmi_backend_ops riscv_dmi_ap_backend = {
+	.name = "ap",
+	.get_info = riscv_dmi_get_info_ap,
+	.reset = riscv_dmi_reset_ap,
+	.prepare_access = riscv_dmi_prepare_access_ap,
+	.batch_alloc = riscv_batch_alloc_ap,
+	.batch_free = riscv_batch_free_common,
+	.batch_run_from = riscv_batch_run_from_ap,
 	.batch_add_dmi_write = riscv_batch_add_dmi_write_direct,
 	.batch_add_dmi_read = riscv_batch_add_dmi_read_direct,
 	.batch_get_dmi_read_op = riscv_batch_get_dmi_read_op_direct,
