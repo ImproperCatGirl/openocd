@@ -24,7 +24,12 @@ struct riscv_dmi_direct_ops {
 	int (*read)(uint32_t address, uint32_t *value);
 	int (*write)(uint32_t address, uint32_t value);
 	int (*reset)(void);
-	void (*batch_exec)(void);
+	int (*batch_exec)(void);
+};
+
+struct riscv_dmi_direct_provider {
+	const char *name;
+	const struct riscv_dmi_direct_ops *ops;
 };
 
 struct riscv_dmi_backend_ops {
@@ -59,11 +64,17 @@ int riscv_dmi_reset(struct target *target);
 int riscv_dmi_prepare_access(struct target *target);
 const struct riscv_dmi_backend_ops *riscv_dmi_backend(struct target *target);
 
+int riscv_dmi_direct_register_provider(const char *name,
+		const struct riscv_dmi_direct_ops *ops);
 void riscv_dmi_direct_register_ops(const struct riscv_dmi_direct_ops *ops);
-int riscv_dmi_direct_read(uint32_t address, uint32_t *value);
-int riscv_dmi_direct_write(uint32_t address, uint32_t value);
-int riscv_dmi_direct_reset(void);
-void riscv_dmi_direct_batch_exec(void);
+const struct riscv_dmi_direct_provider *riscv_dmi_direct_provider_by_name(
+		const char *name);
+const struct riscv_dmi_direct_provider *riscv_dmi_direct_provider_for_dtm(
+		struct riscv_dtm *dtm);
+int riscv_dmi_direct_read(struct target *target, uint32_t address, uint32_t *value);
+int riscv_dmi_direct_write(struct target *target, uint32_t address, uint32_t value);
+int riscv_dmi_direct_reset(struct target *target);
+int riscv_dmi_direct_batch_exec(struct target *target);
 
 int riscv_dmi_jtag_set_ir(const char *ir_name, uint32_t value);
 int riscv_dmi_jtag_use_bscan_tunnel(uint8_t ir_width, int tunnel_type);

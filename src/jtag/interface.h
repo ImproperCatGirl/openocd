@@ -388,6 +388,7 @@ extern struct adapter_driver ep93xx_adapter_driver;
 extern struct adapter_driver esp_usb_adapter_driver;
 extern struct adapter_driver ft232r_adapter_driver;
 extern struct adapter_driver ftdi_adapter_driver;
+extern struct adapter_driver ftdi_rvswd_adapter_driver;
 extern struct adapter_driver gw16012_adapter_driver;
 extern struct adapter_driver hl_adapter_driver;
 extern struct adapter_driver imx_gpio_adapter_driver;

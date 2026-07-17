@@ -25,9 +25,9 @@ int ddmi_dmi_reset(void)
     return ddmi_driver->srst(0,0);
 }
 
-void ddmi_batch_exec(void)
+int ddmi_batch_exec(void)
 {
-    ddmi_driver->batch_exec();
+    return ddmi_driver->batch_exec();
 }
 
 // Your dummy implementations (replace with real PIO/USB)

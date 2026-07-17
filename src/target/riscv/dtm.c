@@ -250,8 +250,25 @@ static void riscv_dtm_destroy_object(struct riscv_dtm_object *obj)
 		free(config);
 	}
 	list_del(&obj->lh);
+	free(obj->dtm.direct_provider_name);
 	free(obj->name);
 	free(obj);
+}
+
+int riscv_dtm_configure_direct_provider(struct riscv_dtm *dtm,
+		const char *provider_name)
+{
+	if (!dtm || !provider_name)
+		return ERROR_FAIL;
+
+	char *name = strdup(provider_name);
+	if (!name)
+		return ERROR_FAIL;
+
+	free(dtm->direct_provider_name);
+	dtm->direct_provider_name = name;
+	dtm->initialized = false;
+	return ERROR_OK;
 }
 
 int riscv_dtm_configure_ap(struct riscv_dtm *dtm, struct adiv5_dap *dap,
@@ -432,6 +449,12 @@ static int dtm_parse_options(struct command_invocation *cmd,
 			}
 			config->ap_num = ap_num;
 			i++;
+		} else if (!strcmp(CMD_ARGV[i], "-direct-provider")) {
+			if (++i == CMD_ARGC)
+				return ERROR_COMMAND_SYNTAX_ERROR;
+			if (riscv_dtm_configure_direct_provider(dtm, CMD_ARGV[i]) != ERROR_OK)
+				return ERROR_FAIL;
+			i++;
 		} else {
 			command_print(cmd, "Unknown DTM option '%s'", CMD_ARGV[i]);
 			return ERROR_COMMAND_ARGUMENT_INVALID;
@@ -565,9 +588,12 @@ COMMAND_HANDLER(handle_dtm_configure)
 			struct riscv_dmi_ap_config *config = dtm->backend_priv;
 			if (config)
 				command_print(CMD, "0x%08" PRIx64, config->ap_num);
-		}
-		else
+		} else if (!strcmp(CMD_ARGV[0], "-direct-provider") && dtm->type == RISCV_DTM_TYPE_DDMI) {
+			if (dtm->direct_provider_name)
+				command_print(CMD, "%s", dtm->direct_provider_name);
+		} else {
 			return ERROR_COMMAND_ARGUMENT_INVALID;
+		}
 		return ERROR_OK;
 	}
 
@@ -598,14 +624,14 @@ static const struct command_registration dtm_instance_commands[] = {
 		.name = "configure",
 		.handler = handle_dtm_configure,
 		.mode = COMMAND_ANY,
-		.usage = "[-type jtag|ddmi|ap] [-chain-position tap] [-dap dap] [-ap-num num]",
+		.usage = "[-type jtag|ddmi|ap] [-chain-position tap] [-dap dap] [-ap-num num] [-direct-provider name]",
 		.help = "Configure a RISC-V DTM instance.",
 	},
 	{
 		.name = "cget",
 		.handler = handle_dtm_configure,
 		.mode = COMMAND_ANY,
-		.usage = "-type|-chain-position|-dap|-ap-num",
+		.usage = "-type|-chain-position|-dap|-ap-num|-direct-provider",
 		.help = "Read a RISC-V DTM instance option.",
 	},
 	{
@@ -645,7 +671,7 @@ static const struct command_registration dtm_subcommand_handlers[] = {
 		.name = "create",
 		.handler = handle_dtm_create,
 		.mode = COMMAND_CONFIG,
-		.usage = "name [-type jtag|ddmi|ap] [-chain-position tap] [-dap dap] [-ap-num num]",
+		.usage = "name [-type jtag|ddmi|ap] [-chain-position tap] [-dap dap] [-ap-num num] [-direct-provider name]",
 		.help = "Create a named RISC-V DTM instance.",
 	},
 	{

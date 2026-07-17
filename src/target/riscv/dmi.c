@@ -9,11 +9,18 @@
 #include "riscv.h"
 
 #include "helper/log.h"
+#include "helper/list.h"
 
 #include <assert.h>
+#include <stdlib.h>
 #include <string.h>
 
-static const struct riscv_dmi_direct_ops *direct_ops;
+struct riscv_dmi_direct_provider_entry {
+	struct list_head lh;
+	struct riscv_dmi_direct_provider provider;
+};
+
+static OOCD_LIST_HEAD(direct_providers);
 
 const struct riscv_dmi_backend_ops *riscv_dmi_backend(struct target *target)
 {
@@ -76,39 +83,118 @@ int riscv_dmi_prepare_access(struct target *target)
 
 void riscv_dmi_direct_register_ops(const struct riscv_dmi_direct_ops *ops)
 {
-	direct_ops = ops;
+	riscv_dmi_direct_register_provider("legacy", ops);
 }
 
-int riscv_dmi_direct_read(uint32_t address, uint32_t *value)
+int riscv_dmi_direct_register_provider(const char *name,
+		const struct riscv_dmi_direct_ops *ops)
 {
-	if (!direct_ops || !direct_ops->read) {
+	if (!name || !ops)
+		return ERROR_FAIL;
+
+	struct riscv_dmi_direct_provider_entry *entry;
+	list_for_each_entry(entry, &direct_providers, lh) {
+		if (!strcmp(entry->provider.name, name)) {
+			entry->provider.ops = ops;
+			return ERROR_OK;
+		}
+	}
+
+	entry = calloc(1, sizeof(*entry));
+	if (!entry)
+		return ERROR_FAIL;
+
+	entry->provider.name = name;
+	entry->provider.ops = ops;
+	list_add_tail(&entry->lh, &direct_providers);
+	return ERROR_OK;
+}
+
+const struct riscv_dmi_direct_provider *riscv_dmi_direct_provider_by_name(
+		const char *name)
+{
+	struct riscv_dmi_direct_provider_entry *entry;
+	list_for_each_entry(entry, &direct_providers, lh) {
+		if (!strcmp(entry->provider.name, name))
+			return &entry->provider;
+	}
+
+	return NULL;
+}
+
+const struct riscv_dmi_direct_provider *riscv_dmi_direct_provider_for_dtm(
+		struct riscv_dtm *dtm)
+{
+	if (!dtm)
+		return NULL;
+
+	if (dtm->direct_provider_name)
+		return riscv_dmi_direct_provider_by_name(dtm->direct_provider_name);
+
+	const struct riscv_dmi_direct_provider *provider = NULL;
+	unsigned int count = 0;
+	struct riscv_dmi_direct_provider_entry *entry;
+	list_for_each_entry(entry, &direct_providers, lh) {
+		provider = &entry->provider;
+		count++;
+	}
+
+	if (count == 1)
+		return provider;
+
+	return NULL;
+}
+
+static const struct riscv_dmi_direct_ops *riscv_dmi_direct_ops_for_target(
+		struct target *target)
+{
+	RISCV_INFO(r);
+	const struct riscv_dmi_direct_provider *provider =
+		riscv_dmi_direct_provider_for_dtm(r->dtm);
+	if (!provider || !provider->ops) {
+		LOG_TARGET_ERROR(target, "No RISC-V Direct DMI provider is available.");
+		return NULL;
+	}
+
+	return provider->ops;
+}
+
+int riscv_dmi_direct_read(struct target *target, uint32_t address, uint32_t *value)
+{
+	const struct riscv_dmi_direct_ops *ops = riscv_dmi_direct_ops_for_target(target);
+	if (!ops || !ops->read) {
 		LOG_ERROR("No direct RISC-V DMI read operation is registered.");
 		return ERROR_FAIL;
 	}
 
-	return direct_ops->read(address, value);
+	return ops->read(address, value);
 }
 
-int riscv_dmi_direct_write(uint32_t address, uint32_t value)
+int riscv_dmi_direct_write(struct target *target, uint32_t address, uint32_t value)
 {
-	if (!direct_ops || !direct_ops->write) {
+	const struct riscv_dmi_direct_ops *ops = riscv_dmi_direct_ops_for_target(target);
+	if (!ops || !ops->write) {
 		LOG_ERROR("No direct RISC-V DMI write operation is registered.");
 		return ERROR_FAIL;
 	}
 
-	return direct_ops->write(address, value);
+	return ops->write(address, value);
 }
 
-int riscv_dmi_direct_reset(void)
+int riscv_dmi_direct_reset(struct target *target)
 {
-	if (direct_ops && direct_ops->reset)
-		return direct_ops->reset();
+	const struct riscv_dmi_direct_ops *ops = riscv_dmi_direct_ops_for_target(target);
+	if (ops && ops->reset)
+		return ops->reset();
 
 	return ERROR_OK;
 }
 
-void riscv_dmi_direct_batch_exec(void)
+int riscv_dmi_direct_batch_exec(struct target *target)
 {
-	if (direct_ops && direct_ops->batch_exec)
-		direct_ops->batch_exec();
+	const struct riscv_dmi_direct_ops *ops = riscv_dmi_direct_ops_for_target(target);
+	if (ops && ops->batch_exec)
+		return ops->batch_exec();
+
+	return ERROR_OK;
 }

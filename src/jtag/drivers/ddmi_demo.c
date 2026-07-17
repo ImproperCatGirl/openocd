@@ -226,9 +226,9 @@ int ddmi_usb_execute_queue(struct jtag_command *cmd_queue)
     return 0;
 }
 
-void ddmi_exec_queue(void)
+int ddmi_exec_queue(void)
 {
-    batch_execute(ddmi_usb_priv.handle, &r_w_buffer);
+    return batch_execute(ddmi_usb_priv.handle, &r_w_buffer);
 }
 static int ddmi_usb_init(void)
 {
@@ -280,7 +280,7 @@ static int ddmi_usb_init(void)
         .reset = ddmi_direct_reset,
         .batch_exec = ddmi_exec_queue,
     };
-    riscv_dmi_direct_register_ops(&direct_ops);
+    riscv_dmi_direct_register_provider("ddmi_usb", &direct_ops);
     ddmi_init_reset(ddmi_usb_priv.handle);
     return ERROR_OK;
 }

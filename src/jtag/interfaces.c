@@ -85,6 +85,7 @@ struct adapter_driver *adapter_drivers[] = {
 #endif
 #if BUILD_FTDI == 1
 		&ftdi_adapter_driver,
+		&ftdi_rvswd_adapter_driver,
 #endif
 #if BUILD_GW16012 == 1
 		&gw16012_adapter_driver,

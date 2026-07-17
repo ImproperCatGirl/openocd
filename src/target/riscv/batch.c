@@ -124,7 +124,7 @@ static int riscv_dmi_get_info_direct(struct target *target, struct riscv_dmi_inf
 
 static int riscv_dmi_reset_direct(struct target *target)
 {
-	return riscv_dmi_direct_reset();
+	return riscv_dmi_direct_reset(target);
 }
 
 static int riscv_dmi_prepare_access_direct(struct target *target)
@@ -310,20 +310,24 @@ static int riscv_batch_run_from_direct(struct riscv_batch *batch, size_t start_i
 	assert(start_idx == 0);
 	keep_alive();
 	for (size_t i = 0; i < batch->direct_batch->used_ops; ++i) {
-		int result = ERROR_OK;
+			int result = ERROR_OK;
 
-		if (batch->direct_batch->ops[i].opcode == RV_OP_READ) {
-			result = riscv_dmi_direct_read(batch->direct_batch->ops[i].params.read.addr,
-				&batch->direct_batch->ops[i].params.read.data_from_target);
-		}
-		if (batch->direct_batch->ops[i].opcode == RV_OP_WRITE) {
-			result = riscv_dmi_direct_write(batch->direct_batch->ops[i].params.write.addr,
-				batch->direct_batch->ops[i].params.write.data_to_target);
-		}
+			if (batch->direct_batch->ops[i].opcode == RV_OP_READ) {
+				result = riscv_dmi_direct_read(batch->target,
+					batch->direct_batch->ops[i].params.read.addr,
+					&batch->direct_batch->ops[i].params.read.data_from_target);
+			}
+			if (batch->direct_batch->ops[i].opcode == RV_OP_WRITE) {
+				result = riscv_dmi_direct_write(batch->target,
+					batch->direct_batch->ops[i].params.write.addr,
+					batch->direct_batch->ops[i].params.write.data_to_target);
+			}
 		if (result != ERROR_OK)
 			return result;
 	}
-	riscv_dmi_direct_batch_exec();
+	int result = riscv_dmi_direct_batch_exec(batch->target);
+	if (result != ERROR_OK)
+		return result;
 	batch->was_run = true;
 	keep_alive();
 	return ERROR_OK;

@@ -32,6 +32,7 @@ struct riscv_dtm {
 	enum riscv_dtm_type type;
 	const struct riscv_dmi_backend_ops *backend;
 	void *backend_priv;
+	char *direct_provider_name;
 	struct jtag_tap *tap;
 	bool initialized;
 
@@ -63,6 +64,8 @@ int riscv_dtm_use_bscan_tunnel(uint8_t ir_width, int tunnel_type);
 int riscv_dtm_set_bscan_tunnel_ir(int ir_id);
 void riscv_dtm_reset_delays(struct riscv_dtm *dtm, int wait);
 int riscv_dtm_configure_ap(struct riscv_dtm *dtm, struct adiv5_dap *dap,
-		uint64_t ap_num);
+			uint64_t ap_num);
+int riscv_dtm_configure_direct_provider(struct riscv_dtm *dtm,
+		const char *provider_name);
 
 #endif /* OPENOCD_TARGET_RISCV_DTM_H */
