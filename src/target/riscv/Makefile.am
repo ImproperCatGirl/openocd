@@ -10,6 +10,7 @@ noinst_LTLIBRARIES += %D%/libriscv.la
        %D%/encoding.h \
        %D%/field_helpers.h \
        %D%/gdb_regs.h \
+       %D%/dtm/internal.h \
        %D%/opcodes.h \
        %D%/program.h \
        %D%/riscv.h \
@@ -31,6 +32,9 @@ noinst_LTLIBRARIES += %D%/libriscv.la
        %D%/debug_defines.c \
        %D%/debug_reg_printer.c \
        %D%/dmi.c \
-       %D%/dtm.c
+       %D%/dtm.c \
+       %D%/dtm/adi_ap.c \
+       %D%/dtm/ddmi.c \
+       %D%/dtm/jtag.c
 
 STARTUP_TCL_SRCS += %D%/startup.tcl

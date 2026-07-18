@@ -3,21 +3,21 @@
 #ifndef OPENOCD_TARGET_RISCV_BATCH_H
 #define OPENOCD_TARGET_RISCV_BATCH_H
 
+#include <assert.h>
+#include <limits.h>
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+
+#include "helper/log.h"
 #include "target/target.h"
-#include "jtag/jtag.h"
 #include "riscv.h"
 
 struct riscv_dmi_backend_ops;
 
-enum riscv_scan_type {
-	RISCV_SCAN_TYPE_INVALID,
-	RISCV_SCAN_TYPE_NOP,
-	RISCV_SCAN_TYPE_READ,
-	RISCV_SCAN_TYPE_WRITE,
-};
-
-/* These types are used to specify how many JTAG RTI cycles to add after a
- * scan.
+/* These types are used to specify backend-specific idle delays after DMI
+ * accesses. JTAG uses them as RTI cycle classes; direct backends may ignore
+ * them when the transport has no idle-cycle concept.
  */
 enum riscv_scan_delay_class {
 	/* Delay needed for accessing debug module registers: */
@@ -122,50 +122,13 @@ static inline int riscv_scan_increase_delay(struct riscv_scan_delays *delays,
 	return ERROR_OK;
 }
 
-struct riscv_dmi_direct_batch;
-
-/* A batch of multiple JTAG scans, which are grouped together to avoid the
- * overhead of some JTAG adapters when sending single commands.  This is
- * designed to support block copies, as that's what we actually need to go
- * fast. */
+/* A batch of multiple DMI operations. Backend-specific batching state is
+ * private to the selected DTM backend.
+ */
 struct riscv_batch {
 	struct target *target;
 	const struct riscv_dmi_backend_ops *backend;
-
-	size_t allocated_scans;
-	size_t used_scans;
-
-	uint8_t *data_out;
-	uint8_t *data_in;
-	struct scan_field *fields;
-	enum riscv_scan_delay_class *delay_classes;
-
-	/* If in BSCAN mode, this field will be allocated (one per scan),
-	   and utilized to tunnel all the scans in the batch.  If not in
-	   BSCAN mode, this field is unallocated and stays NULL */
-	riscv_bscan_tunneled_scan_context_t *bscan_ctxt;
-
-	/* In JTAG we scan out the previous value's output when performing a
-	 * scan.  This is a pain for users, so we just provide them the
-	 * illusion of not having to do this by eliding all but the last NOP.
-	 * */
-	enum riscv_scan_type last_scan;
-
-	/* The read keys. */
-	size_t *read_keys;
-	size_t read_keys_used;
-
-	/* Flag indicating that the last run of the batch finished without an error
-	 * from the underlying JTAG layer of OpenOCD - all scans were performed.
-	 * However, RISC-V DMI "busy" condition could still have occurred.
-	 */
-	bool was_run;
-	/* Number of RTI cycles used by the last scan on the last run.
-	 * Only valid when `was_run` is set.
-	 */
-	unsigned int last_scan_delay;
-	bool finalized;
-	struct riscv_dmi_direct_batch *direct_batch;
+	void *backend_priv;
 };
 
 

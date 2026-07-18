@@ -3396,14 +3396,17 @@ static int read_memory_bus_v1(struct target *target, const struct riscv_mem_acce
 		for (uint32_t i = (next_address - address) / size; i < count - 1; i++) {
 			const uint32_t size_in_words = DIV_ROUND_UP(size, 4);
 			struct riscv_batch *batch = riscv_batch_alloc(target, size_in_words);
+			size_t read_keys[ARRAY_SIZE(sbdata)];
 			/* Read of sbdata0 must be performed as last because it
 			 * starts the new bus data transfer
 			 * (in case "sbcs.sbreadondata" was set above).
 			 * We don't want to start the next bus read before we
 			 * fetch all the data from the last bus read. */
 			for (uint32_t j = size_in_words - 1; j > 0; --j)
-				riscv_batch_add_dm_read(batch, sbdata[j], RISCV_DELAY_BASE);
-			riscv_batch_add_dm_read(batch, sbdata[0], RISCV_DELAY_SYSBUS_READ);
+				read_keys[j] = riscv_batch_add_dm_read(batch, sbdata[j],
+						RISCV_DELAY_BASE);
+			read_keys[0] = riscv_batch_add_dm_read(batch, sbdata[0],
+					RISCV_DELAY_SYSBUS_READ);
 
 			int res = batch_run_timeout(target, batch);
 			if (res != ERROR_OK) {
@@ -3411,9 +3414,8 @@ static int read_memory_bus_v1(struct target *target, const struct riscv_mem_acce
 				return res;
 			}
 
-			const size_t last_key = batch->read_keys_used - 1;
-			for (size_t k = 0; k <= last_key; ++k) {
-				sbvalue[k] = riscv_batch_get_dmi_read_data(batch, last_key - k);
+			for (size_t k = 0; k < size_in_words; ++k) {
+				sbvalue[k] = riscv_batch_get_dmi_read_data(batch, read_keys[k]);
 				buf_set_u32(buffer + i * size + k * 4, 0, MIN(32, 8 * size), sbvalue[k]);
 			}
 
