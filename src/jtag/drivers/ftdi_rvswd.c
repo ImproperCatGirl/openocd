@@ -23,6 +23,7 @@
 #define RVSWD_INITIAL_QUEUE_DEPTH 32
 #define RVSWD_READ_BITS 33
 #define RVSWD_RESET_CLOCKS 100
+#define RVSWD_INTEROP_HOLD_CYCLES 3
 
 static uint8_t ftdi_rvswd_channel;
 static struct mpsse_ctx *rvswd_mpsse_ctx;
@@ -331,6 +332,46 @@ static int rvswd_stop(void)
 	return rvswd_apply_bus_state(true, true, false);
 }
 
+static int rvswd_force_bus_state(bool clk_high, bool swdio_high, bool swdio_drive)
+{
+	struct signal *swclk = find_signal_by_name("SWCLK");
+	struct signal *swdio = find_signal_by_name("SWDIO");
+	if (!swclk || !swdio) {
+		LOG_ERROR("FTDI RVSWD requires SWCLK and SWDIO layout signals.");
+		return ERROR_FAIL;
+	}
+
+	uint16_t new_output = output;
+	uint16_t new_direction = direction;
+
+	if (rvswd_apply_signal_state(&new_output, &new_direction,
+				swclk, clk_high, true) != ERROR_OK)
+		return ERROR_FAIL;
+	if (rvswd_apply_signal_state(&new_output, &new_direction,
+				swdio, swdio_high, swdio_drive) != ERROR_OK)
+		return ERROR_FAIL;
+
+	mpsse_set_data_bits_low_byte(rvswd_mpsse_ctx, new_output & 0xff,
+			new_direction & 0xff);
+	mpsse_set_data_bits_high_byte(rvswd_mpsse_ctx, new_output >> 8,
+			new_direction >> 8);
+
+	output = new_output;
+	direction = new_direction;
+	return ERROR_OK;
+}
+
+static int rvswd_idle_hold(unsigned int hold_cycles)
+{
+	for (unsigned int i = 0; i < hold_cycles; i++) {
+		int retval = rvswd_force_bus_state(true, true, false);
+		if (retval != ERROR_OK)
+			return retval;
+	}
+
+	return ERROR_OK;
+}
+
 static int rvswd_queue_read(uint8_t addr, uint32_t *value)
 {
 	LOG_DEBUG_IO("FTDI RVSWD queue DMI read 0x%02" PRIx8, addr);
@@ -359,6 +400,8 @@ static int rvswd_queue_read(uint8_t addr, uint32_t *value)
 	if (rvswd_write_tail() != ERROR_OK)
 		return ERROR_FAIL;
 	if (rvswd_stop() != ERROR_OK)
+		return ERROR_FAIL;
+	if (rvswd_idle_hold(RVSWD_INTEROP_HOLD_CYCLES) != ERROR_OK)
 		return ERROR_FAIL;
 
 	return ERROR_OK;
@@ -390,6 +433,8 @@ static int rvswd_queue_write(uint8_t addr, uint32_t value)
 	if (rvswd_write_tail() != ERROR_OK)
 		return ERROR_FAIL;
 	if (rvswd_stop() != ERROR_OK)
+		return ERROR_FAIL;
+	if (rvswd_idle_hold(RVSWD_INTEROP_HOLD_CYCLES) != ERROR_OK)
 		return ERROR_FAIL;
 
 	return ERROR_OK;
@@ -455,8 +500,11 @@ done:
 	int retval = queued_retval;
 	queued_retval = ERROR_OK;
 
-	if (led && retval == ERROR_OK)
-		rvswd_set_signal(led, '1');
+	if (led && retval == ERROR_OK) {
+		retval = rvswd_set_signal(led, '1');
+		if (retval == ERROR_OK)
+			retval = mpsse_flush(rvswd_mpsse_ctx);
+	}
 
 	return retval;
 }
@@ -613,7 +661,7 @@ static int ftdi_rvswd_khz(int khz, int *rvswd_speed)
 
 static int ftdi_rvswd_execute_queue(struct jtag_command *cmd_queue)
 {
-	return ERROR_OK;
+	return rvswd_run_queue();
 }
 
 COMMAND_HANDLER(ftdi_rvswd_handle_channel_command)
