@@ -6,6 +6,7 @@
 
 #include <jtag/adapter.h>
 #include <jtag/interface.h>
+#include <server/server.h>
 #include <target/riscv/dmi.h>
 #include <transport/transport.h>
 #include <helper/binarybuffer.h>
@@ -25,12 +26,31 @@
 #define RVSWD_RESET_CLOCKS 100
 #define RVSWD_INTEROP_HOLD_CYCLES 3
 
+#define SWIO_GPIO_ONE_LOW_CYCLES 0
+#define SWIO_GPIO_ZERO_LOW_CYCLES 4
+#define SWIO_GPIO_HIGH_CYCLES 0
+#define SWIO_GPIO_READ_LOW_CYCLES 0
+#define SWIO_GPIO_READ_SAMPLE_CYCLES 1
+#define SWIO_GPIO_READ_POST_CYCLES 1
+#define SWIO_STOP_CYCLES 20
+#define SWIO_RESET_LOW_CYCLES 64
+#define WCH_DMCONTROL 0x10
+#define WCH_DM_CFGR 0x7d
+#define WCH_DM_SHDWCFGR 0x7e
+#define WCH_DM_DEBUG_OUTPUT_ENABLE 0x5aa50400
+
+enum ftdi_rvswd_protocol {
+	FTDI_RVSWD_PROTOCOL_RVSWD,
+	FTDI_RVSWD_PROTOCOL_SWIO,
+};
+
 static uint8_t ftdi_rvswd_channel;
 static struct mpsse_ctx *rvswd_mpsse_ctx;
 static uint16_t output;
 static uint16_t direction;
 static uint16_t output_init;
 static uint16_t direction_init;
+static enum ftdi_rvswd_protocol rvswd_protocol = FTDI_RVSWD_PROTOCOL_RVSWD;
 static int queued_retval;
 
 struct signal {
@@ -372,6 +392,244 @@ static int rvswd_idle_hold(unsigned int hold_cycles)
 	return ERROR_OK;
 }
 
+static int swio_set_pull_high(void)
+{
+	struct signal *pull = find_signal_by_name("SWIO_PULL");
+	if (!pull)
+		return ERROR_OK;
+
+	return rvswd_set_signal(pull, '1');
+}
+
+static int swio_prepare_bus(void)
+{
+	int retval = swio_set_pull_high();
+	if (retval != ERROR_OK)
+		return retval;
+
+	struct signal *swio = find_signal_by_name("SWIO");
+	if (!swio) {
+		LOG_ERROR("FTDI SWIO requires SWIO layout signal.");
+		return ERROR_FAIL;
+	}
+
+	return rvswd_set_signal(swio, 'z');
+}
+
+static int swio_drive_low(void)
+{
+	struct signal *swio = find_signal_by_name("SWIO");
+	if (!swio) {
+		LOG_ERROR("FTDI SWIO requires SWIO layout signal.");
+		return ERROR_FAIL;
+	}
+
+	return rvswd_set_signal(swio, '0');
+}
+
+static int swio_release(void)
+{
+	struct signal *swio = find_signal_by_name("SWIO");
+	if (!swio) {
+		LOG_ERROR("FTDI SWIO requires SWIO layout signal.");
+		return ERROR_FAIL;
+	}
+	if (swio->data_mask == 0 || swio->oe_mask != swio->data_mask) {
+		LOG_ERROR("FTDI SWIO requires a same-mask data/OE signal for open-drain emulation.");
+		return ERROR_FAIL;
+	}
+
+	uint16_t old_output = output;
+	uint16_t old_direction = direction;
+
+	/* Release as high-Z, but preload the output latch high. */
+	output = swio->invert_data ? output & ~swio->data_mask : output | swio->data_mask;
+	direction = swio->invert_oe ? direction | swio->oe_mask : direction & ~swio->oe_mask;
+
+	if ((output & 0xff) != (old_output & 0xff) ||
+			(direction & 0xff) != (old_direction & 0xff))
+		mpsse_set_data_bits_low_byte(rvswd_mpsse_ctx, output & 0xff, direction & 0xff);
+	if ((output >> 8) != (old_output >> 8) ||
+			(direction >> 8) != (old_direction >> 8))
+		mpsse_set_data_bits_high_byte(rvswd_mpsse_ctx, output >> 8, direction >> 8);
+
+	return ERROR_OK;
+}
+
+static void swio_delay_cycles(unsigned int cycles)
+{
+	for (unsigned int i = 0; i < cycles; i++) {
+		mpsse_set_data_bits_low_byte(rvswd_mpsse_ctx,
+				output & 0xff, direction & 0xff);
+		if (output >> 8 || direction >> 8)
+			mpsse_set_data_bits_high_byte(rvswd_mpsse_ctx,
+					output >> 8, direction >> 8);
+	}
+}
+
+static int swio_write_bit(bool bit)
+{
+	if (swio_drive_low() != ERROR_OK)
+		return ERROR_FAIL;
+	swio_delay_cycles(bit ? SWIO_GPIO_ONE_LOW_CYCLES :
+			SWIO_GPIO_ZERO_LOW_CYCLES);
+	if (swio_release() != ERROR_OK)
+		return ERROR_FAIL;
+	swio_delay_cycles(SWIO_GPIO_HIGH_CYCLES);
+	return ERROR_OK;
+}
+
+static int swio_write_nibble(uint8_t value)
+{
+	for (int i = 3; i >= 0; i--) {
+		if (swio_write_bit(!!(value & BIT(i))) != ERROR_OK)
+			return ERROR_FAIL;
+	}
+
+	return ERROR_OK;
+}
+
+static int swio_write_test_pattern_group(void)
+{
+	if (swio_write_nibble(0x0) != ERROR_OK)
+		return ERROR_FAIL;
+	if (swio_write_nibble(0xf) != ERROR_OK)
+		return ERROR_FAIL;
+	return swio_write_nibble(0xa);
+}
+
+static int swio_queue_read_bit(struct rvswd_cmd_queue_entry *entry,
+		unsigned int bit)
+{
+	struct signal *swio = find_signal_by_name("SWIO");
+	if (!swio || !swio->input_mask) {
+		LOG_ERROR("FTDI SWIO requires SWIO input mask.");
+		return ERROR_FAIL;
+	}
+
+	if (swio_drive_low() != ERROR_OK)
+		return ERROR_FAIL;
+	swio_delay_cycles(SWIO_GPIO_READ_LOW_CYCLES);
+	if (swio_release() != ERROR_OK)
+		return ERROR_FAIL;
+	swio_delay_cycles(SWIO_GPIO_READ_SAMPLE_CYCLES);
+
+	if (swio->input_mask & 0xff)
+		mpsse_read_data_bits_low_byte(rvswd_mpsse_ctx, &entry->read_low[bit]);
+	if (swio->input_mask >> 8)
+		mpsse_read_data_bits_high_byte(rvswd_mpsse_ctx, &entry->read_high[bit]);
+
+	swio_delay_cycles(SWIO_GPIO_READ_POST_CYCLES);
+	return ERROR_OK;
+}
+
+static int swio_stop(void)
+{
+	if (swio_release() != ERROR_OK)
+		return ERROR_FAIL;
+	swio_delay_cycles(SWIO_STOP_CYCLES);
+	return ERROR_OK;
+}
+
+static int swio_write_header(uint8_t addr, bool write)
+{
+	if (swio_write_bit(true) != ERROR_OK)
+		return ERROR_FAIL;
+
+	for (int i = 6; i >= 0; i--) {
+		if (swio_write_bit(!!(addr & BIT(i))) != ERROR_OK)
+			return ERROR_FAIL;
+	}
+
+	return swio_write_bit(write);
+}
+
+static int swio_queue_read(uint8_t addr, uint32_t *value)
+{
+	LOG_DEBUG_IO("FTDI SWIO queue DMI read 0x%02" PRIx8, addr);
+
+	if (rvswd_cmd_queue_length >= rvswd_cmd_queue_alloced) {
+		int retval = rvswd_run_queue();
+		if (retval != ERROR_OK)
+			return retval;
+	}
+
+	if (!rvswd_cmd_queue_length) {
+		int retval = swio_prepare_bus();
+		if (retval != ERROR_OK)
+			return retval;
+	}
+
+	struct rvswd_cmd_queue_entry *entry =
+		&rvswd_cmd_queue[rvswd_cmd_queue_length++];
+	memset(entry, 0, sizeof(*entry));
+	entry->read = true;
+	entry->addr = addr;
+	entry->dst = value;
+
+	if (swio_write_header(addr, false) != ERROR_OK)
+		return ERROR_FAIL;
+	for (unsigned int bit = 0; bit < 32; bit++) {
+		if (swio_queue_read_bit(entry, bit) != ERROR_OK)
+			return ERROR_FAIL;
+	}
+
+	return swio_stop();
+}
+
+static int swio_queue_write(uint8_t addr, uint32_t value)
+{
+	LOG_DEBUG_IO("FTDI SWIO queue DMI write 0x%02" PRIx8 " = 0x%08" PRIx32,
+			addr, value);
+
+	if (rvswd_cmd_queue_length >= rvswd_cmd_queue_alloced) {
+		int retval = rvswd_run_queue();
+		if (retval != ERROR_OK)
+			return retval;
+	}
+
+	if (!rvswd_cmd_queue_length) {
+		int retval = swio_prepare_bus();
+		if (retval != ERROR_OK)
+			return retval;
+	}
+
+	struct rvswd_cmd_queue_entry *entry =
+		&rvswd_cmd_queue[rvswd_cmd_queue_length++];
+	memset(entry, 0, sizeof(*entry));
+	entry->addr = addr;
+	entry->data = value;
+
+	if (swio_write_header(addr, true) != ERROR_OK)
+		return ERROR_FAIL;
+
+	for (int i = 31; i >= 0; i--) {
+		if (swio_write_bit(!!(value & BIT(i))) != ERROR_OK)
+			return ERROR_FAIL;
+	}
+
+	return swio_stop();
+}
+
+static int swio_init_debug_interface(void)
+{
+	int retval = swio_queue_write(WCH_DM_SHDWCFGR,
+			WCH_DM_DEBUG_OUTPUT_ENABLE);
+	if (retval != ERROR_OK)
+		return retval;
+	retval = swio_queue_write(WCH_DM_CFGR, WCH_DM_DEBUG_OUTPUT_ENABLE);
+	if (retval != ERROR_OK)
+		return retval;
+	retval = swio_queue_write(WCH_DMCONTROL, 0);
+	if (retval != ERROR_OK)
+		return retval;
+	retval = swio_queue_write(WCH_DMCONTROL, 1);
+	if (retval != ERROR_OK)
+		return retval;
+
+	return rvswd_run_queue();
+}
+
 static int rvswd_queue_read(uint8_t addr, uint32_t *value)
 {
 	LOG_DEBUG_IO("FTDI RVSWD queue DMI read 0x%02" PRIx8, addr);
@@ -459,8 +717,9 @@ static int rvswd_run_queue(void)
 		if (!entry->read)
 			continue;
 
-		struct signal *swdio = find_signal_by_name("SWDIO");
-		if (!swdio || !swdio->input_mask) {
+		struct signal *data_signal = find_signal_by_name(
+				rvswd_protocol == FTDI_RVSWD_PROTOCOL_SWIO ? "SWIO" : "SWDIO");
+		if (!data_signal || !data_signal->input_mask) {
 			queued_retval = ERROR_FAIL;
 			goto done;
 		}
@@ -470,19 +729,25 @@ static int rvswd_run_queue(void)
 		for (unsigned int bit = 0; bit < 32; bit++) {
 			uint16_t sample = entry->read_low[bit] |
 				((uint16_t)entry->read_high[bit] << 8);
-			if (swdio->invert_input)
+			if (data_signal->invert_input)
 				sample = ~sample;
-			bool value = !!(sample & swdio->input_mask);
+			bool value = !!(sample & data_signal->input_mask);
 			if (value)
 				data |= BIT(31 - bit);
 			parity ^= value;
 		}
 
+		if (rvswd_protocol == FTDI_RVSWD_PROTOCOL_SWIO) {
+			if (entry->dst)
+				*entry->dst = data;
+			continue;
+		}
+
 		uint16_t sample = entry->read_low[32] |
 			((uint16_t)entry->read_high[32] << 8);
-		if (swdio->invert_input)
+		if (data_signal->invert_input)
 			sample = ~sample;
-		bool got_parity = !!(sample & swdio->input_mask);
+		bool got_parity = !!(sample & data_signal->input_mask);
 		if (parity != got_parity) {
 			LOG_ERROR("FTDI RVSWD read parity mismatch for DMI 0x%02" PRIx8
 					": value 0x%08" PRIx32 ", expected parity %u, got %u",
@@ -511,16 +776,37 @@ done:
 
 static int rvswd_direct_read(uint32_t address, uint32_t *value)
 {
+	if (rvswd_protocol == FTDI_RVSWD_PROTOCOL_SWIO)
+		return swio_queue_read(address & 0x7f, value);
+
 	return rvswd_queue_read(address & 0x7f, value);
 }
 
 static int rvswd_direct_write(uint32_t address, uint32_t value)
 {
+	if (rvswd_protocol == FTDI_RVSWD_PROTOCOL_SWIO)
+		return swio_queue_write(address & 0x7f, value);
+
 	return rvswd_queue_write(address & 0x7f, value);
 }
 
 static int rvswd_direct_reset(void)
 {
+	if (rvswd_protocol == FTDI_RVSWD_PROTOCOL_SWIO) {
+		LOG_DEBUG_IO("FTDI SWIO line reset");
+		if (swio_set_pull_high() != ERROR_OK)
+			return ERROR_FAIL;
+		if (swio_drive_low() != ERROR_OK)
+			return ERROR_FAIL;
+		swio_delay_cycles(SWIO_RESET_LOW_CYCLES);
+		if (swio_stop() != ERROR_OK)
+			return ERROR_FAIL;
+		int retval = mpsse_flush(rvswd_mpsse_ctx);
+		if (retval != ERROR_OK)
+			return retval;
+		return swio_init_debug_interface();
+	}
+
 	LOG_DEBUG_IO("FTDI RVSWD line reset");
 	if (rvswd_apply_bus_state(true, true, true) != ERROR_OK)
 		return ERROR_FAIL;
@@ -757,6 +1043,25 @@ COMMAND_HANDLER(ftdi_rvswd_handle_layout_signal_command)
 	return ERROR_OK;
 }
 
+COMMAND_HANDLER(ftdi_rvswd_handle_protocol_command)
+{
+	if (CMD_ARGC != 1)
+		return ERROR_COMMAND_SYNTAX_ERROR;
+
+	if (!strcmp(CMD_ARGV[0], "rvswd")) {
+		rvswd_protocol = FTDI_RVSWD_PROTOCOL_RVSWD;
+		return ERROR_OK;
+	}
+
+	if (!strcmp(CMD_ARGV[0], "swio")) {
+		rvswd_protocol = FTDI_RVSWD_PROTOCOL_SWIO;
+		return ERROR_OK;
+	}
+
+	LOG_ERROR("unknown FTDI RVSWD protocol '%s'", CMD_ARGV[0]);
+	return ERROR_COMMAND_ARGUMENT_INVALID;
+}
+
 COMMAND_HANDLER(ftdi_rvswd_handle_set_signal_command)
 {
 	if (CMD_ARGC < 2)
@@ -798,6 +1103,71 @@ COMMAND_HANDLER(ftdi_rvswd_handle_get_signal_command)
 	return ERROR_OK;
 }
 
+COMMAND_HANDLER(ftdi_rvswd_handle_dump_pins_command)
+{
+	if (CMD_ARGC != 0)
+		return ERROR_COMMAND_SYNTAX_ERROR;
+
+	uint8_t data_low = 0;
+	uint8_t data_high = 0;
+
+	mpsse_read_data_bits_low_byte(rvswd_mpsse_ctx, &data_low);
+	mpsse_read_data_bits_high_byte(rvswd_mpsse_ctx, &data_high);
+
+	int retval = mpsse_flush(rvswd_mpsse_ctx);
+	if (retval != ERROR_OK)
+		return retval;
+
+	command_print(CMD, "cached data=%#06" PRIx16 " dir=%#06" PRIx16
+			" sampled=%#06" PRIx16,
+			output, direction, ((uint16_t)data_high << 8) | data_low);
+
+	return ERROR_OK;
+}
+
+COMMAND_HANDLER(ftdi_rvswd_handle_test_pattern_command)
+{
+	uint32_t groups = 0;
+	if (CMD_ARGC > 1)
+		return ERROR_COMMAND_SYNTAX_ERROR;
+	if (CMD_ARGC == 1)
+		COMMAND_PARSE_NUMBER(u32, CMD_ARGV[0], groups);
+
+	if (rvswd_protocol != FTDI_RVSWD_PROTOCOL_SWIO) {
+		LOG_ERROR("FTDI RVSWD test_pattern is currently only implemented for SWIO");
+		return ERROR_FAIL;
+	}
+
+	command_print(CMD, "emitting SWIO 0x0, 0xf, 0xa test pattern%s",
+			groups ? "" : " until shutdown");
+
+	int retval = swio_prepare_bus();
+	if (retval != ERROR_OK)
+		return retval;
+
+	uint32_t emitted = 0;
+	while (!openocd_is_shutdown_pending() && (!groups || emitted < groups)) {
+		uint32_t chunk = 64;
+		if (groups && chunk > groups - emitted)
+			chunk = groups - emitted;
+
+		for (uint32_t i = 0; i < chunk; i++) {
+			retval = swio_write_test_pattern_group();
+			if (retval != ERROR_OK)
+				return retval;
+		}
+
+		retval = mpsse_flush(rvswd_mpsse_ctx);
+		if (retval != ERROR_OK)
+			return retval;
+
+		emitted += chunk;
+		keep_alive();
+	}
+
+	return ERROR_OK;
+}
+
 static const struct command_registration ftdi_rvswd_subcommand_handlers[] = {
 	{
 		.name = "channel",
@@ -821,6 +1191,13 @@ static const struct command_registration ftdi_rvswd_subcommand_handlers[] = {
 		.usage = "name [-data mask|-ndata mask] [-input mask|-ninput mask] [-oe mask|-noe mask] [-alias|-nalias name]",
 	},
 	{
+		.name = "protocol",
+		.handler = ftdi_rvswd_handle_protocol_command,
+		.mode = COMMAND_CONFIG,
+		.help = "select WCH direct-DMI wire protocol",
+		.usage = "(rvswd|swio)",
+	},
+	{
 		.name = "set_signal",
 		.handler = ftdi_rvswd_handle_set_signal_command,
 		.mode = COMMAND_EXEC,
@@ -833,6 +1210,20 @@ static const struct command_registration ftdi_rvswd_subcommand_handlers[] = {
 		.mode = COMMAND_EXEC,
 		.help = "read a layout-specific signal",
 		.usage = "name",
+	},
+	{
+		.name = "dump_pins",
+		.handler = ftdi_rvswd_handle_dump_pins_command,
+		.mode = COMMAND_EXEC,
+		.help = "print cached FTDI GPIO output/direction and sampled input pins",
+		.usage = "",
+	},
+	{
+		.name = "test_pattern",
+		.handler = ftdi_rvswd_handle_test_pattern_command,
+		.mode = COMMAND_EXEC,
+		.help = "emit a repeated SWIO 0x0, 0xf, 0xa waveform test pattern",
+		.usage = "[groups]",
 	},
 	COMMAND_REGISTRATION_DONE
 };
