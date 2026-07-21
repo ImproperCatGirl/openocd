@@ -22,10 +22,19 @@
 #include <string.h>
 
 #define RVSWD_INITIAL_QUEUE_DEPTH 32
+#define SWIO_INITIAL_QUEUE_DEPTH 16
 #define RVSWD_READ_BITS 33
 #define RVSWD_RESET_CLOCKS 100
 #define RVSWD_INTEROP_HOLD_CYCLES 3
 
+/*
+ * SWIO timing is generated with repeated MPSSE SET_BITS_LOW GPIO commands.
+ * Do not treat these counts as adapter-clock cycles. On the tested FTDI setup
+ * each repeated GPIO command is roughly 250-300 ns, with additional fixed
+ * overhead for the drive/release/read command itself. This GPIO-only method is
+ * slower than MPSSE shift-clock timing, but avoids short glitches seen when
+ * mixing native shift commands with GPIO direction changes on the same bus.
+ */
 #define SWIO_GPIO_ONE_LOW_CYCLES 0
 #define SWIO_GPIO_ZERO_LOW_CYCLES 4
 #define SWIO_GPIO_HIGH_CYCLES 0
@@ -33,11 +42,19 @@
 #define SWIO_GPIO_READ_SAMPLE_CYCLES 1
 #define SWIO_GPIO_READ_POST_CYCLES 1
 #define SWIO_STOP_CYCLES 20
+#define SWIO_INTEROP_HOLD_CYCLES 3
 #define SWIO_RESET_LOW_CYCLES 64
 #define WCH_DMCONTROL 0x10
 #define WCH_DM_CFGR 0x7d
 #define WCH_DM_SHDWCFGR 0x7e
 #define WCH_DM_DEBUG_OUTPUT_ENABLE 0x5aa50400
+
+/*
+ * MPSSE auto-flushes when its internal command buffers fill. That is safe for
+ * normal shift commands, but SWIO DMI transactions are synthesized from many
+ * GPIO commands and must not be split in the middle. Keep the SWIO transaction
+ * queue small enough that only rvswd_run_queue() decides the flush boundary.
+ */
 
 enum ftdi_rvswd_protocol {
 	FTDI_RVSWD_PROTOCOL_RVSWD,
@@ -531,6 +548,14 @@ static int swio_stop(void)
 	return ERROR_OK;
 }
 
+static int swio_idle_hold(unsigned int hold_cycles)
+{
+	if (swio_release() != ERROR_OK)
+		return ERROR_FAIL;
+	swio_delay_cycles(hold_cycles);
+	return ERROR_OK;
+}
+
 static int swio_write_header(uint8_t addr, bool write)
 {
 	if (swio_write_bit(true) != ERROR_OK)
@@ -574,7 +599,11 @@ static int swio_queue_read(uint8_t addr, uint32_t *value)
 			return ERROR_FAIL;
 	}
 
-	return swio_stop();
+	int retval = swio_stop();
+	if (retval != ERROR_OK)
+		return retval;
+
+	return swio_idle_hold(SWIO_INTEROP_HOLD_CYCLES);
 }
 
 static int swio_queue_write(uint8_t addr, uint32_t value)
@@ -608,7 +637,11 @@ static int swio_queue_write(uint8_t addr, uint32_t value)
 			return ERROR_FAIL;
 	}
 
-	return swio_stop();
+	int retval = swio_stop();
+	if (retval != ERROR_OK)
+		return retval;
+
+	return swio_idle_hold(SWIO_INTEROP_HOLD_CYCLES);
 }
 
 static int swio_init_debug_interface(void)
@@ -853,7 +886,8 @@ static int ftdi_rvswd_initialize(void)
 	mpsse_loopback_config(rvswd_mpsse_ctx, false);
 	mpsse_set_frequency(rvswd_mpsse_ctx, adapter_get_speed_khz() * 1000);
 
-	rvswd_cmd_queue_alloced = RVSWD_INITIAL_QUEUE_DEPTH;
+	rvswd_cmd_queue_alloced = rvswd_protocol == FTDI_RVSWD_PROTOCOL_SWIO ?
+		SWIO_INITIAL_QUEUE_DEPTH : RVSWD_INITIAL_QUEUE_DEPTH;
 	rvswd_cmd_queue = calloc(rvswd_cmd_queue_alloced, sizeof(*rvswd_cmd_queue));
 	if (!rvswd_cmd_queue)
 		return ERROR_JTAG_INIT_FAILED;
